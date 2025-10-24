@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/World.h"
+#include <string>
 
 #include <string>
 

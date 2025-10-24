@@ -105,61 +105,6 @@ setup_dependencies()
         echo "AirSim successfully set up."
     fi
 
-    # DLSS setup
-    if dependency_missing Plugins/DLSS "Nvidia DLSS"
-    then
-        echo "Downloading Nvidia DLSS..."
-        if ! wget -O temp/DLSS.zip https://dlss.download.nvidia.com/uebinarypackages/${DLSS_VER}.zip
-        then
-            echo "Failed to download Nvidia DLSS!"
-            return 1
-        fi
-
-        echo "Extracting Nvidia DLSS..."
-        mkdir temp/DLSS
-        unzip temp/DLSS.zip -d temp/DLSS
-        rm temp/DLSS.zip
-
-        mkdir -p Plugins/
-
-        cp -r temp/DLSS/Plugins/DLSS Plugins/
-
-        rm -rf temp/DLSS
-
-        echo "Nvidia DLSS successfully set up."
-    fi
-
-    # FSR setup
-    # (The FSR plugin does not actually compile on Linux, so skip it)
-    if false && dependency_missing Plugins/FSR4 "AMD FSR 4"
-    then
-        echo "Downloading AMD FSR 4..."
-        if ! wget -O temp/FSR.zip https://gpuopen.com/download-Unreal-Engine-FSR4-plugin/
-        then
-            echo "Failed to download AMD FSR 4!"
-            return 1
-        fi
-
-        echo "Extracting AMD FSR..."
-        mkdir temp/FSR
-        unzip temp/FSR.zip -d temp/FSR
-        rm temp/FSR.zip
-
-        mkdir -p Plugins/
-        
-        FSR_FOLDER=$(find temp/FSR -maxdepth 1 -type d -regex "temp/FSR/UE-FSR-.*")
-        
-        cp -r ${FSR_FOLDER}/FSR4-${FSR_VER}/FSR4 Plugins/
-        cp -r ${FSR_FOLDER}/FSR4-${FSR_VER}/FSR4MovieRenderPipeline Plugins/
-        
-        # Make sure we don't delete anything unexpected if the folder is wrong for whatever reason
-        if [[ $FSR_FOLDER == temp/FSR/UE-FSR-* ]]
-        then
-            rm -rf ${FSR_FOLDER}
-        fi
-        
-        echo "AMD FSR 4 successfully set up."
-    fi
 
     # ImpostorBaker setup
     if dependency_missing Plugins/ImpostorBaker-master ImpostorBaker
@@ -195,7 +140,7 @@ setup_dependencies()
 
         echo "Building Kvazaar..."
 
-        if ! cmake temp/kvazaar-${KVAZAAR_VER} -Btemp/kvazaar-${KVAZAAR_VER}/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_COMPILER=clang-${CLANG_VER}
+        if ! cmake temp/kvazaar-${KVAZAAR_VER} -Btemp/kvazaar-${KVAZAAR_VER}/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_COMPILER=clang
         then
             echo "Failed to build Kvazaar!"
             return 1
@@ -226,25 +171,23 @@ setup_dependencies()
     if dependency_missing ThirdParty/OpenHEVC OpenHEVC
     then
         echo "Downloading OpenHEVC..."
-        if ! wget -O temp/OpenHEVC.zip https://github.com/OpenHEVC/openHEVC/archive/refs/heads/${OPENHEVC_VER}.zip
-        then
-            echo "Failed to download OpenHEVC!"
-        fi
+        #if ! wget -O temp/OpenHEVC.zip https://github.com/OpenHEVC/openHEVC/archive/refs/heads/${OPENHEVC_VER}.zip
+        #then
+        #    echo "Failed to download OpenHEVC!"
+        #fi
 
         echo "Extracting OpenHEVC..."
-        unzip temp/OpenHEVC.zip -d temp
-        rm temp/OpenHEVC.zip
+        #unzip temp/OpenHEVC.zip -d temp
+        #rm temp/OpenHEVC.zip
 
-        sh temp/configure --disable-asm --enable-pic
+        # Note: configure script doesn't exist in this version, skip it
 
         # sysctl.h is deprecated
-        sed -i 's|#include <sys/sysctl.h>|//#include <sys/sysctl.h>|g' temp/openHEVC-${OPENHEVC_VER}/libavutil/cpu.c
-        # This assembly no longer works
-        sed -i -E 's/"(ci|ic)"\s*\(\(uint8_t\)\(?([a-z-]*)\)?\)/"c" \(\2 \& 0x1F\)/g' temp/openHEVC-${OPENHEVC_VER}/libavcodec/x86/mathops.h
+        #sed -i '' 's|#include <sys/sysctl.h>|//#include <sys/sysctl.h>|g' temp/openHEVC-${OPENHEVC_VER}/libavutil/cpu.c
 
         echo "Building OpenHEVC..."
 
-        if ! cmake temp/openHEVC-${OPENHEVC_VER} -Btemp/openHEVC-${OPENHEVC_VER}/build -DENABLE_STATIC=True -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_COMPILER=clang-${CLANG_VER}
+        if ! cmake temp/openHEVC-${OPENHEVC_VER} -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Btemp/openHEVC-${OPENHEVC_VER}/build -DENABLE_STATIC=True -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_COMPILER=clang
         then
             echo "Failed to build OpenHEVC!"
             return 1
@@ -266,7 +209,7 @@ setup_dependencies()
         cp temp/openHEVC-${OPENHEVC_VER}/gpac/modules/openhevc_dec/openHevcWrapper.h ThirdParty/OpenHEVC/Include
 
         echo "Cleaning up OpenHEVC files..."
-        rm -rf temp/openHEVC-${OPENHEVC_VER}
+        # rm -rf temp/openHEVC-${OPENHEVC_VER}
 
         echo "OpenHEVC successfully set up."
     fi
@@ -288,7 +231,7 @@ setup_dependencies()
         echo "Building uvgRTP..."
 
         mkdir temp/uvgRTP-${UVGRTP_VER}/Release
-        if ! cmake temp/uvgRTP-${UVGRTP_VER} -Btemp/uvgRTP-${UVGRTP_VER}/Release -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_CXX_COMPILER=clang++-${CLANG_VER} -DCMAKE_CXX_FLAGS=-stdlib=libc++
+        if ! cmake temp/uvgRTP-${UVGRTP_VER} -Btemp/uvgRTP-${UVGRTP_VER}/Release -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-stdlib=libc++
         then
             echo "Failed to build uvgRTP!"
             return 1
@@ -331,7 +274,7 @@ setup_dependencies()
 
         echo "Building fpng..."
 
-        if ! clang++-${CLANG_VER} -c temp/fpng-${FPNG_VER}/src/fpng.cpp -o temp/fpng-${FPNG_VER}/fpng.o -msse4 -mpclmul -fPIC -stdlib=libc++
+        if ! clang++ -c temp/fpng-${FPNG_VER}/src/fpng.cpp -o temp/fpng-${FPNG_VER}/fpng.o -fPIC -stdlib=libc++
         then
             echo "Failed to build fpng!"
             return 1
