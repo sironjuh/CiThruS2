@@ -29,8 +29,8 @@ RtpTransmitter::RtpTransmitter(const std::string& ip, const int& dstPort)
 		// Configure common RTP context params
 		stream_->configure_ctx(RCC_CLOCK_RATE, 90000);
 		// Reduce MTU significantly for testing - prevents issues with large NAL units
-		// Standard Ethernet MTU is 1500, but we use 1000 to be conservative for localhost testing
-		stream_->configure_ctx(RCC_MTU_SIZE, 1000);
+		// Standard Ethernet MTU is 1500, but we use 1200 to be conservative for localhost testing
+		stream_->configure_ctx(RCC_MTU_SIZE, 1200);
 		stream_->configure_ctx(RCC_DYN_PAYLOAD_TYPE, 96); // use PT=96 for H265
 		
 		// Increase UDP buffer sizes to prevent packet drops

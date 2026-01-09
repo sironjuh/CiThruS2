@@ -46,7 +46,7 @@ setup_dependencies()
 		
 		unzip temp/CiThruS2_content.zip -d .
 		
-		rm temp/CiThruS2_content.zip
+		#rm temp/CiThruS2_content.zip
 
         # Make editor load regions automatically
         mkdir -p Saved/Config/LinuxEditor
@@ -58,52 +58,6 @@ setup_dependencies()
 
 		echo "Finished setting up CiThruS2 content."
 	fi
-
-    # AirSim setup
-    # (Skip this for now, AirSim is outdated)
-    if false && dependency_missing Plugins/AirSim AirSim
-    then
-        echo "Downloading AirSim (from Colosseum)..."
-        if ! git clone https://github.com/ArttuLeppaaho/Colosseum temp/Colosseum
-        then
-            echo "Failed to download AirSim!"
-            return 1
-        fi
-        
-        cd temp/Colosseum
-        git submodule update --init
-        cd ../..
-
-        echo Running AirSim setup...
-        if ! bash temp/Colosseum/setup.sh
-        then
-            echo "Failed to setup AirSim!"
-            return 1
-        fi
-
-        echo Building AirSim...
-        if ! bash temp/Colosseum/build.sh
-        then
-            echo "Failed to build AirSim!"
-            return 1
-        fi
-
-        echo "Copying AirSim plugin files..."
-        mkdir -p Plugins
-
-        cp -r temp/Colosseum/Unreal/Plugins Plugins
-
-        # Tiny patch to prevent AirSim from changing the Unreal Engine world origin, which would break CiThruS traffic systems
-        sed -i 's|    this->GetWorld()->SetNewWorldOrigin(FIntVector(player_loc) + this->GetWorld()->OriginLocation);|    //this->GetWorld()->SetNewWorldOrigin(FIntVector(player_loc) + this->GetWorld()->OriginLocation);|g' Plugins/AirSim/Source/SimMode/SimModeBase.cpp
-
-        # Another patch to remove an unused folder which was accidentally included in the Colosseum release and prevents it from compiling
-        rm -rf Plugins/AirSim/Source/AssetCode
-
-        echo "Cleaning up AirSim files..."
-        rm -rf temp/Colosseum-${AIRSIM_VER}
-
-        echo "AirSim successfully set up."
-    fi
 
 
     # ImpostorBaker setup
@@ -136,7 +90,7 @@ setup_dependencies()
 
         echo "Extracting Kvazaar..."
         unzip temp/Kvazaar.zip -d temp
-        rm temp/Kvazaar.zip
+        #rm temp/Kvazaar.zip
 
         echo "Building Kvazaar..."
 
@@ -171,13 +125,13 @@ setup_dependencies()
     if dependency_missing ThirdParty/OpenHEVC OpenHEVC
     then
         echo "Downloading OpenHEVC..."
-        #if ! wget -O temp/OpenHEVC.zip https://github.com/OpenHEVC/openHEVC/archive/refs/heads/${OPENHEVC_VER}.zip
-        #then
-        #    echo "Failed to download OpenHEVC!"
-        #fi
+        if ! wget -O temp/OpenHEVC.zip https://github.com/OpenHEVC/openHEVC/archive/refs/heads/${OPENHEVC_VER}.zip
+        then
+            echo "Failed to download OpenHEVC!"
+        fi
 
         echo "Extracting OpenHEVC..."
-        #unzip temp/OpenHEVC.zip -d temp
+        unzip temp/OpenHEVC.zip -d temp
         #rm temp/OpenHEVC.zip
 
         # Note: configure script doesn't exist in this version, skip it
