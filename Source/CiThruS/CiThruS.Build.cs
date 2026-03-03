@@ -142,10 +142,11 @@ public class CiThruS : ModuleRules
             }
             else
             {
-                // Without static FFmpeg, disable OpenHEVC to avoid unresolved ff_* symbols and do not link the wrapper
-                PublicDefinitions.Add("CITHRUS_OPENHEVC_DISABLED=1");
+                // Check if OpenHEVC dynamic library is available
+                string openhevcDylib = Path.Combine(openhevc_base_path, "Lib/libLibOpenHevcWrapper.dylib");
+                bool hasOpenHevcDylib = File.Exists(openhevcDylib);
 
-                // Optional: fall back to dynamic/system libs from Homebrew for other components (not used by OpenHEVC now)
+                // Fall back to dynamic/system libs from Homebrew
                 string[] dylibs = new[]
                 {
                     "libavcodec.dylib",
@@ -167,6 +168,18 @@ public class CiThruS : ModuleRules
                         string name = Path.GetFileNameWithoutExtension(d);
                         PublicSystemLibraries.Add(name.StartsWith("lib") ? name.Substring(3) : name);
                     }
+                }
+
+                // Enable OpenHEVC if the dylib exists and Homebrew FFmpeg is available
+                if (hasOpenHevcDylib)
+                {
+                    PublicDefinitions.Add("CITHRUS_OPENHEVC_DISABLED=0");
+                    PublicAdditionalLibraries.Add(openhevcDylib);
+                }
+                else
+                {
+                    // Disable OpenHEVC if no library is available
+                    PublicDefinitions.Add("CITHRUS_OPENHEVC_DISABLED=1");
                 }
             }
         }

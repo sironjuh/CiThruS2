@@ -380,7 +380,7 @@ void HevcEncoder::Process()
 			frameProperties = CFDictionaryCreate(kCFAllocatorDefault, 
 				(const void**)keys, (const void**)values, 1,
 				&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Forcing keyframe at frame %lld"), frameCounter_);
+			//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Forcing keyframe at frame %lld"), frameCounter_);
 		}
 		
 		frameCounter_++;
@@ -464,8 +464,8 @@ void HevcEncoder::Process()
 				double avgTotal = totalFrame / 30.0;
 				double fps = 1000.0 / avgTotal;
 				
-				UE_LOG(LogTemp, Log, TEXT("HevcEncoder PERF (30 frames avg): BufCreate=%.2fms, YUVConv=%.2fms, Encode=%.2fms, Total=%.2fms (%.1f fps, %d bytes)"), 
-					avgBufCreate, avgConversion, avgEncode, avgTotal, fps, (int)encodedData_.size());
+				//UE_LOG(LogTemp, Log, TEXT("HevcEncoder PERF (30 frames avg): BufCreate=%.2fms, YUVConv=%.2fms, Encode=%.2fms, Total=%.2fms (%.1f fps, %d bytes)"), 
+				//	avgBufCreate, avgConversion, avgEncode, avgTotal, fps, (int)encodedData_.size());
 				
 				// Reset accumulators
 				totalBufCreate = totalConversion = totalEncode = totalFrame = 0;
@@ -638,16 +638,16 @@ static void LogAnnexBAU(const uint8_t* data, size_t size)
 			else if (nalType == 34) hasPPS = true;
 			else if (nalType == 19 || nalType == 20) hasIDR = true;
 			
-			UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
-				nalCount, nalType, *nalName, nalSize);
+			//UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
+			//	nalCount, nalType, *nalName, nalSize);
 			nalCount++;
 		}
 		
 		offset = nalEnd;
 	}
 	
-	UE_LOG(LogTemp, Log, TEXT("HevcEncoder: AU size=%d, keyframe=%d (VPS=%d SPS=%d PPS=%d IDR=%d), NALs=%d"),
-		(int)size, hasIDR ? 1 : 0, hasVPS ? 1 : 0, hasSPS ? 1 : 0, hasPPS ? 1 : 0, hasIDR ? 1 : 0, nalCount);
+	//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: AU size=%d, keyframe=%d (VPS=%d SPS=%d PPS=%d IDR=%d), NALs=%d"),
+	//	(int)size, hasIDR ? 1 : 0, hasVPS ? 1 : 0, hasSPS ? 1 : 0, hasPPS ? 1 : 0, hasIDR ? 1 : 0, nalCount);
 }
 
 // Parse and log length-prefixed (HVCC) access unit details
@@ -689,8 +689,8 @@ static void LogHvccAU(const uint8_t* data, size_t size, int naluLengthSize)
 		else if (nalType == 34) hasPPS = true;
 		else if (nalType == 19 || nalType == 20) hasIDR = true;
 		
-		UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
-			nalCount, nalType, *nalName, (int)naluLength);
+		//UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
+		//	nalCount, nalType, *nalName, (int)naluLength);
 		nalCount++;
 		
 		offset += naluLength;
@@ -760,8 +760,8 @@ void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBu
 					if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, i, &parameterSet, &parameterSetSize, nullptr, nullptr) == noErr)
 					{
 						uint8_t nalType = HevcNalType(parameterSet, parameterSetSize);
-						UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Injecting parameter set NAL type=%d (%s), size=%d"),
-							nalType, *NalTypeName(nalType), (int)parameterSetSize);
+						//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Injecting parameter set NAL type=%d (%s), size=%d"),
+						//	nalType, *NalTypeName(nalType), (int)parameterSetSize);
 						encodedData_.insert(encodedData_.end(), {0x00,0x00,0x00,0x01});
 						encodedData_.insert(encodedData_.end(), parameterSet, parameterSet + parameterSetSize);
 					}
@@ -814,10 +814,10 @@ void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBu
 			// Log first 8 bytes in hex for comparison with RTP transmitter
 			if (encodedData_.size() >= 8)
 			{
-				UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Output %d bytes, head=%02X %02X %02X %02X %02X %02X %02X %02X"),
-					(int)encodedData_.size(),
-					encodedData_[0], encodedData_[1], encodedData_[2], encodedData_[3],
-					encodedData_[4], encodedData_[5], encodedData_[6], encodedData_[7]);
+				//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Output %d bytes, head=%02X %02X %02X %02X %02X %02X %02X %02X"),
+				//	(int)encodedData_.size(),
+				//	encodedData_[0], encodedData_[1], encodedData_[2], encodedData_[3],
+				//	encodedData_[4], encodedData_[5], encodedData_[6], encodedData_[7]);
 			}
 			// Parse and log the Annex-B access unit
 			LogAnnexBAU(encodedData_.data(), encodedData_.size());
