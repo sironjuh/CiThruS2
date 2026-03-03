@@ -68,6 +68,38 @@ uint8_t GetHevcNalType(const uint8_t* nalData, uint32_t nalSize)
 	return (nalData[0] & 0x7E) >> 1;
 }
 
+bool ExtractRtpAggregationPacketNals(const uint8_t* data, uint32_t size, std::vector<FNalUnitView>& nalUnits)
+{
+	// RFC7798 AP payload:
+	// - 2-byte AP NAL header (type 48)
+	// - repeated: 2-byte nal_unit_size + nal_unit_bytes
+	if (!data || size < 4 || GetHevcNalType(data, size) != 48)
+	{
+		return false;
+	}
+
+	uint32_t offset = 2;
+	uint32_t extractedCount = 0;
+	while (offset + 2 <= size)
+	{
+		const uint32_t nalSize = (static_cast<uint32_t>(data[offset]) << 8) |
+								 static_cast<uint32_t>(data[offset + 1]);
+		offset += 2;
+
+		if (nalSize == 0 || offset + nalSize > size)
+		{
+			break;
+		}
+
+		const uint8_t* nalData = data + offset;
+		nalUnits.push_back(FNalUnitView{ nalData, nalSize, GetHevcNalType(nalData, nalSize) });
+		extractedCount++;
+		offset += nalSize;
+	}
+
+	return extractedCount > 0;
+}
+
 bool IsParameterSetNal(const uint8_t nalType)
 {
 	return nalType == 32 || nalType == 33 || nalType == 34;
@@ -122,6 +154,11 @@ void ExtractNalUnits(const uint8_t* data, uint32_t size, const bool hasAnnexBPre
 
 	if (!hasAnnexBPrefix)
 	{
+		if (ExtractRtpAggregationPacketNals(data, size, nalUnits))
+		{
+			return;
+		}
+
 		nalUnits.push_back(FNalUnitView{ data, size, GetHevcNalType(data, size) });
 		return;
 	}
@@ -201,6 +238,7 @@ HevcDecoder::HevcDecoder(const uint8_t& threadCount, EHevcDecoderBackend backend
 	, videoToolboxDecodedSampleCount_(0)
 	, videoToolboxNoOutputSampleCount_(0)
 	, videoToolboxNalLogCount_(0)
+	, videoToolboxWaitingForParamsDropCount_(0)
 #endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE
 {
 	buffers_[0] = nullptr;
@@ -449,17 +487,21 @@ bool HevcDecoder::DecodeWithOpenHevc(const uint8_t* inputData, uint32_t inputSiz
 bool HevcDecoder::CacheParameterSet(const uint8_t* nalData, uint32_t nalSize, uint8_t nalType)
 {
 	std::vector<uint8_t>* destination = nullptr;
+	const TCHAR* parameterSetName = TEXT("unknown");
 
 	switch (nalType)
 	{
 	case 32:
 		destination = &vps_;
+		parameterSetName = TEXT("VPS");
 		break;
 	case 33:
 		destination = &sps_;
+		parameterSetName = TEXT("SPS");
 		break;
 	case 34:
 		destination = &pps_;
+		parameterSetName = TEXT("PPS");
 		break;
 	default:
 		return false;
@@ -473,6 +515,14 @@ bool HevcDecoder::CacheParameterSet(const uint8_t* nalData, uint32_t nalSize, ui
 
 	destination->assign(nalData, nalData + nalSize);
 	videoToolboxParameterSetsDirty_ = true;
+	videoToolboxWaitingForParamsDropCount_ = 0;
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("HevcDecoder(VideoToolbox): cached %s (%u bytes)"),
+		parameterSetName,
+		nalSize);
 	return true;
 }
 
@@ -567,6 +617,7 @@ bool HevcDecoder::CreateOrRecreateVideoToolboxSession()
 	}
 
 	videoToolboxParameterSetsDirty_ = false;
+	videoToolboxWaitingForParamsDropCount_ = 0;
 	UE_LOG(LogTemp, Log, TEXT("HevcDecoder(VideoToolbox): decoder session configured"));
 	return true;
 }
@@ -890,7 +941,14 @@ void HevcDecoder::Process()
 			videoToolboxPendingAuHasVcl_ = videoToolboxPendingAuHasVcl_ || hasVcl;
 		};
 
-		auto flushPendingAu = [this, &decodedFrame]() -> bool
+		auto clearPendingAu = [this]()
+		{
+			videoToolboxPendingAuHvcc_.clear();
+			videoToolboxPendingAuHasVcl_ = false;
+			videoToolboxPendingAuNalCount_ = 0;
+		};
+
+		auto flushPendingAu = [this, &decodedFrame, &clearPendingAu]() -> bool
 		{
 			if (!videoToolboxPendingAuHasVcl_ || videoToolboxPendingAuHvcc_.empty())
 			{
@@ -899,7 +957,27 @@ void HevcDecoder::Process()
 
 			if (!EnsureVideoToolboxSession())
 			{
+				const bool hasAllParameterSets = !vps_.empty() && !sps_.empty() && !pps_.empty();
+				if (!hasAllParameterSets)
+				{
+					videoToolboxWaitingForParamsDropCount_++;
+					if (videoToolboxWaitingForParamsDropCount_ <= 5 || (videoToolboxWaitingForParamsDropCount_ % 120) == 0)
+					{
+						UE_LOG(
+							LogTemp,
+							Warning,
+							TEXT("HevcDecoder(VideoToolbox): dropping pending AU while waiting VPS/SPS/PPS (count=%u, nals=%u, bytes=%u)"),
+							videoToolboxWaitingForParamsDropCount_,
+							videoToolboxPendingAuNalCount_,
+							static_cast<uint32_t>(videoToolboxPendingAuHvcc_.size()));
+					}
+
+					clearPendingAu();
+					return true;
+				}
+
 				TryFallbackToOpenHevc("VideoToolbox session creation failed");
+				clearPendingAu();
 				return false;
 			}
 
@@ -935,9 +1013,7 @@ void HevcDecoder::Process()
 				}
 			}
 
-			videoToolboxPendingAuHvcc_.clear();
-			videoToolboxPendingAuHasVcl_ = false;
-			videoToolboxPendingAuNalCount_ = 0;
+			clearPendingAu();
 			return true;
 		};
 
@@ -958,6 +1034,12 @@ void HevcDecoder::Process()
 			const bool isVcl = IsVclNal(nal.type);
 			if (!isVcl)
 			{
+				// Ignore non-VCL metadata until we have a picture AU in flight.
+				if (!videoToolboxPendingAuHasVcl_)
+				{
+					continue;
+				}
+
 				appendNalToPendingAu(nal.data, nal.size, false);
 				continue;
 			}

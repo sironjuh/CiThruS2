@@ -97,5 +97,6 @@ protected:
 	uint32_t videoToolboxDecodedSampleCount_;
 	uint32_t videoToolboxNoOutputSampleCount_;
 	uint32_t videoToolboxNalLogCount_;
+	uint32_t videoToolboxWaitingForParamsDropCount_;
 #endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE
 };

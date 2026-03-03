@@ -81,6 +81,12 @@ void RtpReceiver::Process()
 		GetOutputPin<0>().SetData(currentFrame_->payload);
 		GetOutputPin<0>().SetSize(currentFrame_->payload_len);
 	}
+	else
+	{
+		// Prevent downstream stages from re-processing stale payload when no fresh RTP frame is available.
+		GetOutputPin<0>().SetData(nullptr);
+		GetOutputPin<0>().SetSize(0);
+	}
 
 	queueMutex_.unlock();
 #endif // CITHRUS_UVGRTP_AVAILABLE
