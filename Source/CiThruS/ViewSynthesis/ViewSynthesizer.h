@@ -18,6 +18,14 @@ class RenderTargetReader;
 class RenderTargetWriter;
 class AsyncPipelineRunner;
 
+UENUM(BlueprintType)
+enum class EHevcDecoderBackend : uint8
+{
+	Auto UMETA(DisplayName = "Auto"),
+	OpenHEVC UMETA(DisplayName = "OpenHEVC"),
+	VideoToolbox UMETA(DisplayName = "VideoToolbox")
+};
+
 // Performs view synthesis
 UCLASS()
 class AViewSynthesizer : public AActor
@@ -60,6 +68,9 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	FString saveDirectory_ = FString(FPlatformProcess::UserDir()) + "CiThruS2/Recorded/";
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	EHevcDecoderBackend hevcDecoderBackend_ = EHevcDecoderBackend::Auto;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Kvazaar Settings")
 	int overlappedWavefront_ = 3;

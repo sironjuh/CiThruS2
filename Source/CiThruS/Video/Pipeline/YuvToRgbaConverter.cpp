@@ -10,6 +10,24 @@
 #include <stdexcept>
 #include <array>
 
+namespace
+{
+inline uint8_t ClampByte(const int value)
+{
+    if (value < 0)
+    {
+        return 0;
+    }
+
+    if (value > 255)
+    {
+        return 255;
+    }
+
+    return static_cast<uint8_t>(value);
+}
+}
+
 YuvToRgbaConverter::YuvToRgbaConverter(const uint16_t& frameWidth, const uint16_t& frameHeight, const std::string& format)
     : outputFrameWidth_(frameWidth), outputFrameHeight_(frameHeight)
 {
@@ -41,13 +59,38 @@ void YuvToRgbaConverter::Process()
 {
     const uint8_t* inputData = GetInputPin<0>().GetData();
     size_t inputSize = GetInputPin<0>().GetSize();
+    const size_t expectedInputSize = outputFrameWidth_ * outputFrameHeight_ * 3 / 2;
 
-    if (!inputData || inputSize != outputFrameWidth_ * outputFrameHeight_ * 3 / 2)
+    if (!inputData || inputSize != expectedInputSize)
     {
+        static uint32_t sizeMismatchLogCount = 0;
+        if (inputData && inputSize > 0 && sizeMismatchLogCount < 10)
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("YuvToRgbaConverter: input size mismatch, got=%u expected=%u (w=%u h=%u)"),
+                static_cast<uint32_t>(inputSize),
+                static_cast<uint32_t>(expectedInputSize),
+                static_cast<uint32_t>(outputFrameWidth_),
+                static_cast<uint32_t>(outputFrameHeight_));
+            sizeMismatchLogCount++;
+        }
         return;
     }
 
+#ifdef CITHRUS_SSE41_AVAILABLE
     YuvToRgbaSse41(inputData, &outputData_, outputFrameWidth_, outputFrameHeight_);
+#else
+    static bool loggedScalarFallback = false;
+    if (!loggedScalarFallback)
+    {
+        UE_LOG(LogTemp, Log, TEXT("YuvToRgbaConverter: SSE4.1 unavailable, using scalar fallback."));
+        loggedScalarFallback = true;
+    }
+
+    YuvToRgbaScalar(inputData, outputData_, outputFrameWidth_, outputFrameHeight_);
+#endif // CITHRUS_SSE41_AVAILABLE
 }
 
 void YuvToRgbaConverter::YuvToRgbaSse41(const uint8_t* input, uint8_t** output, int width, int height)
@@ -190,4 +233,58 @@ void YuvToRgbaConverter::YuvToRgbaSse41(const uint8_t* input, uint8_t** output, 
     free(row_b);
 
 #endif // CITHRUS_SSE41_AVAILABLE
+}
+
+void YuvToRgbaConverter::YuvToRgbaScalar(const uint8_t* input, uint8_t* output, int width, int height)
+{
+    if (!input || !output || width <= 0 || height <= 0)
+    {
+        return;
+    }
+
+    const uint8_t* yPlane = input;
+    const uint8_t* uPlane = yPlane + (width * height);
+    const uint8_t* vPlane = uPlane + (width * height / 4);
+
+    const std::string outputFormat = GetOutputPin<0>().GetFormat();
+    const bool bgra = (outputFormat == "bgra");
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            const int yIndex = y * width + x;
+            const int uvIndex = (y / 2) * (width / 2) + (x / 2);
+
+            const int Y = static_cast<int>(yPlane[yIndex]);
+            const int U = static_cast<int>(uPlane[uvIndex]) - 128;
+            const int V = static_cast<int>(vPlane[uvIndex]) - 128;
+
+            // BT.601 full-range approximation
+            const int r = Y + ((91881 * V) >> 16);
+            const int g = Y - ((22554 * U + 46802 * V) >> 16);
+            const int b = Y + ((116130 * U) >> 16);
+
+            const uint8_t R = ClampByte(r);
+            const uint8_t G = ClampByte(g);
+            const uint8_t B = ClampByte(b);
+
+            const int outIndex = yIndex * 4;
+
+            if (bgra)
+            {
+                output[outIndex + 0] = B;
+                output[outIndex + 1] = G;
+                output[outIndex + 2] = R;
+            }
+            else
+            {
+                output[outIndex + 0] = R;
+                output[outIndex + 1] = G;
+                output[outIndex + 2] = B;
+            }
+
+            output[outIndex + 3] = 255;
+        }
+    }
 }

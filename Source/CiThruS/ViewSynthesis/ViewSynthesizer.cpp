@@ -244,7 +244,7 @@ bool AViewSynthesizer::StartStreams()
                         new RtpReceiver(TCHAR_TO_UTF8(*remoteStreamIp_), remoteStreamPort_ - 1),
                         new ImageSequentialFilter(
                             {
-                                new HevcDecoder(16),
+                                new HevcDecoder(16, hevcDecoderBackend_),
                                 new YuvToRgbaConverter(frameWidth, frameHeight, "bgra"),
                                 //new BlinkDetector("stop.txt"),
                             }),

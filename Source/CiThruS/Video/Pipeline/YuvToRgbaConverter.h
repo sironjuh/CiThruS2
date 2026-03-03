@@ -26,4 +26,5 @@ protected:
 	uint16_t outputFrameHeight_;
 
 	void YuvToRgbaSse41(const uint8_t* input, uint8_t** output, int width, int height);
+	void YuvToRgbaScalar(const uint8_t* input, uint8_t* output, int width, int height);
 };

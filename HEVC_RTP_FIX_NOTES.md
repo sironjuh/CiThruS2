@@ -197,6 +197,16 @@ If issues persist after applying the fix:
 6. **Test with file dump**: Enable `CITHRUS_HEVC_DUMP` to dump .h265 file and test with `ffplay`
 7. **Network issues**: Check for packet loss with `iftop` or `tcpdump`
 
+## macOS Decode Backend A/B Testing
+
+`AViewSynthesizer` now exposes `hevcDecoderBackend_` under **General Stream Settings**:
+
+- `Auto`: On macOS, tries VideoToolbox first and falls back to OpenHEVC if VT decoder session init fails.
+- `OpenHEVC`: Forces OpenHEVC decode path.
+- `VideoToolbox`: Tries VT decode path and falls back to OpenHEVC if VT session setup fails.
+
+This allows quick backend comparisons when debugging RTP/HEVC decode issues without changing pipeline wiring (`HevcDecoder` output stays `yuv420`).
+
 ---
 
 **Date**: 2025-01-08  

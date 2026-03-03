@@ -134,8 +134,8 @@ void RtpTransmitter::Process()
 	
 	if (shouldLog)
 	{
-		UE_LOG(LogTemp, Log, TEXT("RtpTransmitter: Parsed %d NAL units from %d bytes%s"),
-			(int)nalUnits.size(), (int)inputSize, isKeyframe ? TEXT(" [KEYFRAME]") : TEXT(""));
+		//UE_LOG(LogTemp, Log, TEXT("RtpTransmitter: Parsed %d NAL units from %d bytes%s"),
+		//	(int)nalUnits.size(), (int)inputSize, isKeyframe ? TEXT(" [KEYFRAME]") : TEXT(""));
 		framesSinceLog = 0;
 	}
 	framesSinceLog++;
@@ -150,7 +150,7 @@ void RtpTransmitter::Process()
 		
 		if (shouldLog && nalIndex < 3) // Log first 3 NALs of logged frames
 		{
-			UE_LOG(LogTemp, Log, TEXT("  Sending NAL #%d: type=%d, size=%d"), nalIndex, nalType, (int)nal.second);
+			//UE_LOG(LogTemp, Log, TEXT("  Sending NAL #%d: type=%d, size=%d"), nalIndex, nalType, (int)nal.second);
 		}
 		
 		// Use RTP_NO_H26X_SCL flag to indicate we're providing NAL units without start codes

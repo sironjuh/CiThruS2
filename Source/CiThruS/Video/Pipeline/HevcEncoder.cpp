@@ -394,6 +394,7 @@ void HevcEncoder::Process()
 		
 		// Encode the frame
 		auto encodeStart = std::chrono::high_resolution_clock::now();
+		VTEncodeInfoFlags encodeInfoFlags = 0;
 		OSStatus encodeStatus = VTCompressionSessionEncodeFrame(
 			compressionSession_,
 			pixelBuffer,
@@ -401,7 +402,7 @@ void HevcEncoder::Process()
 			duration,
 			frameProperties,
 			NULL,
-			NULL);
+			&encodeInfoFlags);
 		
 		if (frameProperties)
 		{
@@ -416,6 +417,11 @@ void HevcEncoder::Process()
 			GetOutputPin<0>().SetData(nullptr);
 			GetOutputPin<0>().SetSize(0);
 			return;
+		}
+
+		if ((encodeInfoFlags & kVTEncodeInfo_FrameDropped) != 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: VT reported frame dropped"));
 		}
 		
 		// Wait for encoding to complete (synchronous behavior)
@@ -718,9 +724,7 @@ void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBu
 {
 	UE_LOG(LogTemp, Verbose, TEXT("HandleEncodedFrame: status=%d, sampleBuffer=%p"), (int)status, sampleBuffer);
 	std::lock_guard<std::mutex> lock(encodeMutex_);
-	
-	encodedData_.clear();
-	
+
 	if (status == noErr && sampleBuffer)
 	{
 		// Get the encoded data from the sample buffer
@@ -840,6 +844,14 @@ void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBu
 			}
 			#endif
 		}
+	}
+	else if (status != noErr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Compression callback status=%d"), (int)status);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Compression callback returned empty sample"));
 	}
 	
 	encodeComplete_ = true;
