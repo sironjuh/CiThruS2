@@ -6,6 +6,7 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <cstdint>
 
 class UTexture2D;
 class UTextureRenderTarget2D;
@@ -40,6 +41,19 @@ protected:
 	std::condition_variable renderCommandCv_;
 	uint32_t pendingRenderCommandCount_ = 0;
 
+	std::mutex perfMutex_;
+	double uploadCopyMsTotal_ = 0.0;
+	double uploadQueueWaitMsTotal_ = 0.0;
+	double uploadUpdateMsTotal_ = 0.0;
+	double uploadEndToEndMsTotal_ = 0.0;
+	uint32_t uploadCopySamples_ = 0;
+	uint32_t uploadQueueWaitSamples_ = 0;
+	uint32_t uploadUpdateSamples_ = 0;
+	uint32_t uploadEndToEndSamples_ = 0;
+	uint32_t perfFramesAccumulated_ = 0;
+	uint32_t perfLogInterval_ = 120;
+	uint64_t droppedFrames_ = 0;
+
 	// These are separate because theoretically this object may get destroyed before being initialized,
 	// in which case the initialization needs to be cancelled
 	bool initialized_;
@@ -47,4 +61,7 @@ protected:
 
 	void BeginRenderCommand();
 	void EndRenderCommand();
+	void RecordCopySample(double milliseconds);
+	void RecordDroppedFrame(uint64_t count = 1);
+	void RecordRenderSamples(double queueWaitMs, double updateMs, double endToEndMs);
 };

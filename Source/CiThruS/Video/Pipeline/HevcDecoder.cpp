@@ -3,7 +3,9 @@
 #include "Misc/Debug.h"
 #include "ViewSynthesis/ViewSynthesizer.h"
 
+#include <chrono>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace
@@ -230,8 +232,12 @@ HevcDecoder::HevcDecoder(const uint8_t& threadCount, EHevcDecoderBackend backend
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
 	, videoToolboxSession_(nullptr)
 	, videoToolboxFormatDescription_(nullptr)
+	, videoToolboxCallbackState_(nullptr)
 	, videoToolboxParameterSetsDirty_(false)
 	, videoToolboxDecodedFrameReady_(false)
+	, videoToolboxPendingDecodeCount_(0)
+	, videoToolboxDroppedFrameCount_(0)
+	, videoToolboxMaxPendingFrames_(3)
 	, videoToolboxPendingAuHasVcl_(false)
 	, videoToolboxPendingAuNalCount_(0)
 	, videoToolboxSubmittedSampleCount_(0)
@@ -570,7 +576,7 @@ bool HevcDecoder::CreateOrRecreateVideoToolboxSession()
 
 	if (status != noErr || !videoToolboxFormatDescription_)
 	{
-		++videoToolboxErrorCount_;
+		videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed);
 		UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): CMVideoFormatDescriptionCreateFromHEVCParameterSets failed status=%d"), (int)status);
 		return false;
 	}
@@ -594,8 +600,19 @@ bool HevcDecoder::CreateOrRecreateVideoToolboxSession()
 	CFDictionarySetValue(destinationAttributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProperties);
 	CFRelease(ioSurfaceProperties);
 
+	if (!videoToolboxCallbackState_)
+	{
+		videoToolboxCallbackState_ = new VideoToolboxCallbackState();
+	}
+
+	{
+		std::lock_guard<std::mutex> callbackLock(videoToolboxCallbackState_->Mutex);
+		videoToolboxCallbackState_->Decoder = this;
+		videoToolboxCallbackState_->ActiveCallbacks = 0;
+	}
+
 	VTDecompressionOutputCallbackRecord callbackRecord = {};
-	callbackRecord.decompressionOutputRefCon = this;
+	callbackRecord.decompressionOutputRefCon = videoToolboxCallbackState_;
 	callbackRecord.decompressionOutputCallback = DecompressionOutputCallback;
 
 	status = VTDecompressionSessionCreate(
@@ -610,9 +627,14 @@ bool HevcDecoder::CreateOrRecreateVideoToolboxSession()
 
 	if (status != noErr || !videoToolboxSession_)
 	{
-		++videoToolboxErrorCount_;
+		videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed);
 		UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): VTDecompressionSessionCreate failed status=%d"), (int)status);
 		DestroyVideoToolboxSession();
+		if (videoToolboxCallbackState_)
+		{
+			delete videoToolboxCallbackState_;
+			videoToolboxCallbackState_ = nullptr;
+		}
 		return false;
 	}
 
@@ -624,11 +646,51 @@ bool HevcDecoder::CreateOrRecreateVideoToolboxSession()
 
 void HevcDecoder::DestroyVideoToolboxSession()
 {
+	VideoToolboxCallbackState* callbackState = videoToolboxCallbackState_;
+	if (callbackState)
+	{
+		std::lock_guard<std::mutex> callbackLock(callbackState->Mutex);
+		callbackState->Decoder = nullptr;
+	}
+
 	if (videoToolboxSession_)
 	{
+		const OSStatus waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(videoToolboxSession_);
+		if (waitStatus != noErr)
+		{
+			const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): teardown wait failed status=%d (%s)"), (int)waitStatus, DecodeVtStatus(waitStatus));
+			}
+		}
+
 		VTDecompressionSessionInvalidate(videoToolboxSession_);
 		CFRelease(videoToolboxSession_);
 		videoToolboxSession_ = nullptr;
+	}
+
+	if (callbackState)
+	{
+		std::unique_lock<std::mutex> callbackLock(callbackState->Mutex);
+		const bool drained = callbackState->Cv.wait_for(
+			callbackLock,
+			std::chrono::milliseconds(500),
+			[callbackState] { return callbackState->ActiveCallbacks == 0; });
+		if (!drained)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): timed out waiting for decode callbacks to drain"));
+		}
+		callbackLock.unlock();
+		delete callbackState;
+		videoToolboxCallbackState_ = nullptr;
+	}
+
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		videoToolboxCompletedFrames_.clear();
+		videoToolboxPublishedFrame_.clear();
+		videoToolboxPendingDecodeCount_ = 0;
 	}
 
 	if (videoToolboxFormatDescription_)
@@ -662,6 +724,36 @@ bool HevcDecoder::DecodeWithVideoToolboxSample(const uint8_t* sampleData, uint32
 		return false;
 	}
 
+	uint32_t droppedFrameCount = 0;
+	uint32_t pendingDecodeCount = 0;
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		if (videoToolboxPendingDecodeCount_ >= videoToolboxMaxPendingFrames_)
+		{
+			++videoToolboxDroppedFrameCount_;
+			droppedFrameCount = videoToolboxDroppedFrameCount_;
+			pendingDecodeCount = videoToolboxPendingDecodeCount_;
+		}
+		else
+		{
+			++videoToolboxPendingDecodeCount_;
+		}
+	}
+
+	if (droppedFrameCount > 0)
+	{
+		if (droppedFrameCount <= 5 || (droppedFrameCount % 60) == 0)
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("HevcDecoder(VideoToolbox): dropping AU due to decode backlog (pending=%u dropped=%u)"),
+				pendingDecodeCount,
+				droppedFrameCount);
+		}
+		return true;
+	}
+
 	CMBlockBufferRef blockBuffer = nullptr;
 	OSStatus status = CMBlockBufferCreateWithMemoryBlock(
 		kCFAllocatorDefault,
@@ -685,8 +777,15 @@ bool HevcDecoder::DecodeWithVideoToolboxSample(const uint8_t* sampleData, uint32
 
 	if (status != kCMBlockBufferNoErr || !blockBuffer)
 	{
-		++videoToolboxErrorCount_;
-		if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
+		{
+			std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+			if (videoToolboxPendingDecodeCount_ > 0)
+			{
+				--videoToolboxPendingDecodeCount_;
+			}
+		}
+		const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): CMBlockBuffer setup failed status=%d (%s)"), (int)status, DecodeVtStatus(status));
 		}
@@ -708,8 +807,15 @@ bool HevcDecoder::DecodeWithVideoToolboxSample(const uint8_t* sampleData, uint32
 
 	if (status != noErr || !sampleBuffer)
 	{
-		++videoToolboxErrorCount_;
-		if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
+		{
+			std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+			if (videoToolboxPendingDecodeCount_ > 0)
+			{
+				--videoToolboxPendingDecodeCount_;
+			}
+		}
+		const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): CMSampleBufferCreateReady failed status=%d (%s)"), (int)status, DecodeVtStatus(status));
 		}
@@ -719,39 +825,88 @@ bool HevcDecoder::DecodeWithVideoToolboxSample(const uint8_t* sampleData, uint32
 
 	videoToolboxDecodedFrameReady_ = false;
 
+	std::unique_ptr<PendingDecodeContext> decodeContext(new PendingDecodeContext());
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		decodeContext->SampleIndex = videoToolboxSubmittedSampleCount_ + 1;
+	}
+
 	VTDecodeInfoFlags decodeInfoFlags = 0;
 	status = VTDecompressionSessionDecodeFrame(
 		videoToolboxSession_,
 		sampleBuffer,
 		kVTDecodeFrame_EnableAsynchronousDecompression,
-		nullptr,
+		decodeContext.get(),
 		&decodeInfoFlags);
-
-	if (status == noErr)
-	{
-		const OSStatus waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(videoToolboxSession_);
-		if (waitStatus != noErr)
-		{
-			++videoToolboxErrorCount_;
-			if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): VTDecompressionSessionWaitForAsynchronousFrames failed status=%d (%s)"), (int)waitStatus, DecodeVtStatus(waitStatus));
-			}
-		}
-	}
-	else
-	{
-		++videoToolboxErrorCount_;
-		if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): VTDecompressionSessionDecodeFrame failed status=%d (%s)"), (int)status, DecodeVtStatus(status));
-		}
-	}
 
 	CFRelease(sampleBuffer);
 	CFRelease(blockBuffer);
 
-	return status == noErr && videoToolboxDecodedFrameReady_;
+	if (status != noErr)
+	{
+		{
+			std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+			if (videoToolboxPendingDecodeCount_ > 0)
+			{
+				--videoToolboxPendingDecodeCount_;
+			}
+		}
+		const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): VTDecompressionSessionDecodeFrame failed status=%d (%s)"), (int)status, DecodeVtStatus(status));
+		}
+		return false;
+	}
+
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		++videoToolboxSubmittedSampleCount_;
+	}
+	decodeContext.release();
+	return true;
+}
+
+void HevcDecoder::DrainCompletedVideoToolboxFrames()
+{
+	VideoToolboxDecodedFrame latestFrame;
+	uint32_t staleFrameCount = 0;
+	uint32_t totalDroppedFrameCount = 0;
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		if (videoToolboxCompletedFrames_.empty())
+		{
+			return;
+		}
+
+		if (videoToolboxCompletedFrames_.size() > 1)
+		{
+			staleFrameCount = static_cast<uint32_t>(videoToolboxCompletedFrames_.size() - 1);
+			videoToolboxDroppedFrameCount_ += staleFrameCount;
+			totalDroppedFrameCount = videoToolboxDroppedFrameCount_;
+		}
+
+		latestFrame = std::move(videoToolboxCompletedFrames_.back());
+		videoToolboxCompletedFrames_.clear();
+	}
+
+	videoToolboxPublishedFrame_ = std::move(latestFrame.Data);
+	if (!videoToolboxPublishedFrame_.empty())
+	{
+		outputData_ = videoToolboxPublishedFrame_.data();
+		outputSize_ = static_cast<uint32_t>(videoToolboxPublishedFrame_.size());
+		videoToolboxDecodedFrameReady_ = true;
+	}
+
+	if (staleFrameCount > 0 && (totalDroppedFrameCount <= 5 || (totalDroppedFrameCount % 60) == 0))
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("HevcDecoder(VideoToolbox): dropping stale decoded frames before display (stale=%u dropped=%u)"),
+			staleFrameCount,
+			totalDroppedFrameCount);
+	}
 }
 
 void HevcDecoder::DecompressionOutputCallback(
@@ -763,26 +918,67 @@ void HevcDecoder::DecompressionOutputCallback(
 	CMTime presentationTimeStamp,
 	CMTime presentationDuration)
 {
-	(void)sourceFrameRefCon;
 	(void)infoFlags;
 	(void)presentationTimeStamp;
 	(void)presentationDuration;
 
-	HevcDecoder* decoder = static_cast<HevcDecoder*>(decompressionOutputRefCon);
-	if (decoder)
+	VideoToolboxCallbackState* callbackState = static_cast<VideoToolboxCallbackState*>(decompressionOutputRefCon);
+	PendingDecodeContext* decodeContext = static_cast<PendingDecodeContext*>(sourceFrameRefCon);
+	if (!callbackState)
 	{
-		decoder->HandleDecodedFrame(status, imageBuffer);
+		delete decodeContext;
+		return;
 	}
+
+	HevcDecoder* decoder = nullptr;
+	{
+		std::lock_guard<std::mutex> callbackLock(callbackState->Mutex);
+		++callbackState->ActiveCallbacks;
+		decoder = callbackState->Decoder;
+	}
+
+	struct FScopedDecodeCallback
+	{
+		VideoToolboxCallbackState* State;
+		~FScopedDecodeCallback()
+		{
+			std::lock_guard<std::mutex> callbackLock(State->Mutex);
+			if (State->ActiveCallbacks > 0)
+			{
+				--State->ActiveCallbacks;
+			}
+			State->Cv.notify_all();
+		}
+	} callbackScope{ callbackState };
+
+	if (!decoder)
+	{
+		delete decodeContext;
+		return;
+	}
+
+	decoder->HandleDecodedFrame(status, imageBuffer, decodeContext);
 }
 
-void HevcDecoder::HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuffer)
+void HevcDecoder::HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuffer, void* sourceFrameRefCon)
 {
+	std::unique_ptr<PendingDecodeContext> decodeContext(static_cast<PendingDecodeContext*>(sourceFrameRefCon));
 	videoToolboxDecodedFrameReady_ = false;
+
+	auto decrementPendingDecode = [this]()
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		if (videoToolboxPendingDecodeCount_ > 0)
+		{
+			--videoToolboxPendingDecodeCount_;
+		}
+	};
 
 	if (status != noErr || !imageBuffer)
 	{
-		++videoToolboxErrorCount_;
-		if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
+		decrementPendingDecode();
+		const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): decode callback status=%d (%s)"), (int)status, DecodeVtStatus(status));
 		}
@@ -795,27 +991,23 @@ void HevcDecoder::HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuff
 
 	if (width == 0 || height == 0 || (width % 2) != 0 || (height % 2) != 0)
 	{
-		++videoToolboxErrorCount_;
+		decrementPendingDecode();
+		videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed);
 		UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): invalid decoded frame size %dx%d"), static_cast<int>(width), static_cast<int>(height));
 		return;
 	}
 
-	outputSize_ = static_cast<uint32_t>(width * height * 3 / 2);
-	if (bufferSizes_[bufferIndex_] != outputSize_)
-	{
-		delete[] buffers_[bufferIndex_];
-		buffers_[bufferIndex_] = new uint8_t[outputSize_];
-		bufferSizes_[bufferIndex_] = outputSize_;
-	}
-
-	uint8_t* dst = buffers_[bufferIndex_];
+	const uint32_t decodedSize = static_cast<uint32_t>(width * height * 3 / 2);
+	std::vector<uint8_t> decodedData(decodedSize);
+	uint8_t* dst = decodedData.data();
 	uint8_t* dstY = dst;
 	uint8_t* dstU = dst + width * height;
 	uint8_t* dstV = dstU + (width * height / 4);
 
 	if (CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
 	{
-		++videoToolboxErrorCount_;
+		decrementPendingDecode();
+		videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
@@ -877,26 +1069,49 @@ void HevcDecoder::HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuff
 
 	if (!copied)
 	{
-		++videoToolboxErrorCount_;
-		if (videoToolboxErrorCount_ <= 5 || (videoToolboxErrorCount_ % 60) == 0)
+		decrementPendingDecode();
+		const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("HevcDecoder(VideoToolbox): unsupported pixel format 0x%x"), (unsigned)pixelFormat);
 		}
 		return;
 	}
 
-	outputData_ = buffers_[bufferIndex_];
-	videoToolboxDecodedFrameReady_ = true;
+	uint32_t decodedSampleCount = 0;
+	uint32_t droppedFrameCount = 0;
+	{
+		std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+		if (videoToolboxPendingDecodeCount_ > 0)
+		{
+			--videoToolboxPendingDecodeCount_;
+		}
+		if (videoToolboxCompletedFrames_.size() >= videoToolboxMaxPendingFrames_)
+		{
+			videoToolboxCompletedFrames_.pop_front();
+			++videoToolboxDroppedFrameCount_;
+			droppedFrameCount = videoToolboxDroppedFrameCount_;
+		}
+		videoToolboxCompletedFrames_.push_back({ std::move(decodedData), static_cast<uint32_t>(width), static_cast<uint32_t>(height) });
+		++videoToolboxDecodedSampleCount_;
+		decodedSampleCount = videoToolboxDecodedSampleCount_;
+		videoToolboxNoOutputSampleCount_ = 0;
+	}
 
-	if (videoToolboxDecodedSampleCount_ < 10 || (videoToolboxDecodedSampleCount_ % 120) == 0)
+	if (droppedFrameCount > 0 && (droppedFrameCount <= 5 || (droppedFrameCount % 60) == 0))
+	{
+		UE_LOG(LogTemp, Log, TEXT("HevcDecoder(VideoToolbox): dropping queued decoded frame due to display backlog (dropped=%u)"), droppedFrameCount);
+	}
+
+	if (decodedSampleCount < 10 || (decodedSampleCount % 120) == 0)
 	{
 		UE_LOG(
 			LogTemp,
 			Log,
-			TEXT("HevcDecoder(VideoToolbox): decoded frame ready %ux%u (%u bytes)"),
+			TEXT("HevcDecoder(VideoToolbox): decoded frame queued %ux%u (%u bytes)"),
 			static_cast<uint32_t>(width),
 			static_cast<uint32_t>(height),
-			outputSize_);
+			decodedSize);
 	}
 }
 #endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE
@@ -908,11 +1123,41 @@ void HevcDecoder::Process()
 	outputData_ = nullptr;
 	outputSize_ = 0;
 
+	auto publishDecodedOutput = [this]() -> bool
+	{
+		if (!outputData_ || outputSize_ == 0)
+		{
+			return false;
+		}
+
+		GetOutputPin<0>().SetData(outputData_);
+		GetOutputPin<0>().SetSize(outputSize_);
+		return true;
+	};
+
+	bool decodedFrame = false;
+	bool openHevcDecodedFrame = false;
+
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	if (useVideoToolbox_)
+	{
+		DrainCompletedVideoToolboxFrames();
+		decodedFrame = outputData_ && outputSize_ > 0;
+	}
+#endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE && PLATFORM_MAC
+
+	if (!backendConfigured_)
+	{
+		publishDecodedOutput();
+		return;
+	}
+
 	const uint8_t* inputData = GetInputPin<0>().GetData();
 	const uint32_t inputSize = GetInputPin<0>().GetSize();
 
-	if (!inputData || inputSize == 0 || !backendConfigured_)
+	if (!inputData || inputSize == 0)
 	{
+		publishDecodedOutput();
 		return;
 	}
 
@@ -922,10 +1167,9 @@ void HevcDecoder::Process()
 	ExtractNalUnits(inputData, inputSize, hasAnnexBPrefix, nalUnits);
 	if (nalUnits.empty())
 	{
+		publishDecodedOutput();
 		return;
 	}
-
-	bool decodedFrame = false;
 
 #if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
 	if (useVideoToolbox_)
@@ -948,7 +1192,7 @@ void HevcDecoder::Process()
 			videoToolboxPendingAuNalCount_ = 0;
 		};
 
-		auto flushPendingAu = [this, &decodedFrame, &clearPendingAu]() -> bool
+		auto flushPendingAu = [this, &clearPendingAu]() -> bool
 		{
 			if (!videoToolboxPendingAuHasVcl_ || videoToolboxPendingAuHvcc_.empty())
 			{
@@ -983,38 +1227,31 @@ void HevcDecoder::Process()
 
 			const uint32_t submittedNalCount = videoToolboxPendingAuNalCount_;
 			const uint32_t submittedBytes = static_cast<uint32_t>(videoToolboxPendingAuHvcc_.size());
-
-			const bool gotFrame = DecodeWithVideoToolboxSample(
+			const bool submitted = DecodeWithVideoToolboxSample(
 				videoToolboxPendingAuHvcc_.data(),
 				static_cast<uint32_t>(videoToolboxPendingAuHvcc_.size()));
 
-			videoToolboxSubmittedSampleCount_++;
-
-			if (gotFrame)
+			const uint32_t videoToolboxErrorCount = videoToolboxErrorCount_.load(std::memory_order_relaxed);
+			uint32_t decodedSampleCount = 0;
 			{
-				videoToolboxDecodedSampleCount_++;
-				videoToolboxNoOutputSampleCount_ = 0;
-				decodedFrame = true;
+				std::lock_guard<std::mutex> queueLock(videoToolboxQueueMutex_);
+				decodedSampleCount = videoToolboxDecodedSampleCount_;
 			}
-			else
+
+			if (!submitted && (videoToolboxErrorCount <= 5 || (videoToolboxErrorCount % 60) == 0))
 			{
-				videoToolboxNoOutputSampleCount_++;
-				if (videoToolboxNoOutputSampleCount_ <= 5 || (videoToolboxNoOutputSampleCount_ % 60) == 0)
-				{
-					UE_LOG(
-						LogTemp,
-						Warning,
-						TEXT("HevcDecoder(VideoToolbox): submitted AU but no frame output (noOutput=%u, submitted=%u, decoded=%u, auNals=%u, auBytes=%u)"),
-						videoToolboxNoOutputSampleCount_,
-						videoToolboxSubmittedSampleCount_,
-						videoToolboxDecodedSampleCount_,
-						submittedNalCount,
-						submittedBytes);
-				}
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("HevcDecoder(VideoToolbox): failed to submit AU to decoder (submitted=%u decoded=%u auNals=%u auBytes=%u)"),
+					videoToolboxSubmittedSampleCount_,
+					decodedSampleCount,
+					submittedNalCount,
+					submittedBytes);
 			}
 
 			clearPendingAu();
-			return true;
+			return submitted;
 		};
 
 		for (const FNalUnitView& nal : nalUnits)
@@ -1034,7 +1271,6 @@ void HevcDecoder::Process()
 			const bool isVcl = IsVclNal(nal.type);
 			if (!isVcl)
 			{
-				// Ignore non-VCL metadata until we have a picture AU in flight.
 				if (!videoToolboxPendingAuHasVcl_)
 				{
 					continue;
@@ -1077,9 +1313,7 @@ void HevcDecoder::Process()
 			}
 		}
 
-		// If we got a complete single-NAL VCL frame in this packet and no boundary appeared,
-		// allow immediate decode to avoid waiting forever on boundary-less streams.
-		if (!decodedFrame && nalUnits.size() == 1 && IsVclNal(nalUnits[0].type) && videoToolboxPendingAuHasVcl_)
+		if (nalUnits.size() == 1 && IsVclNal(nalUnits[0].type) && videoToolboxPendingAuHasVcl_)
 		{
 			const bool firstSlice = IsFirstSliceSegmentInPicture(nalUnits[0].data, nalUnits[0].size, nalUnits[0].type);
 			if (firstSlice)
@@ -1092,15 +1326,17 @@ void HevcDecoder::Process()
 
 	if (!decodedFrame && useOpenHevc_)
 	{
-		decodedFrame = DecodeWithOpenHevc(inputData, inputSize, hasAnnexBPrefix);
+		openHevcDecodedFrame = DecodeWithOpenHevc(inputData, inputSize, hasAnnexBPrefix);
+		decodedFrame = openHevcDecodedFrame;
 	}
 
-	if (!decodedFrame || !outputData_ || outputSize_ == 0)
+	if (!decodedFrame || !publishDecodedOutput())
 	{
 		return;
 	}
 
-	GetOutputPin<0>().SetData(outputData_);
-	GetOutputPin<0>().SetSize(outputSize_);
-	bufferIndex_ = (bufferIndex_ + 1) % 2;
+	if (openHevcDecodedFrame)
+	{
+		bufferIndex_ = (bufferIndex_ + 1) % 2;
+	}
 }

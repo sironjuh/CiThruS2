@@ -6,9 +6,14 @@
 #include <smmintrin.h>
 #endif // CITHRUS_SSE41_AVAILABLE
 
+#if defined(CITHRUS_NEON_AVAILABLE)
+#include <arm_neon.h>
+#endif // CITHRUS_NEON_AVAILABLE
+
 #include <algorithm>
-#include <stdexcept>
 #include <array>
+#include <cstdint>
+#include <stdexcept>
 
 namespace
 {
@@ -26,6 +31,58 @@ inline uint8_t ClampByte(const int value)
 
     return static_cast<uint8_t>(value);
 }
+
+#if defined(CITHRUS_NEON_AVAILABLE)
+inline uint8x8_t PackClampedBytes(const int32x4_t lowValues, const int32x4_t highValues)
+{
+    return vqmovun_s16(vcombine_s16(vqmovn_s32(lowValues), vqmovn_s32(highValues)));
+}
+
+inline void StoreYuvBlockAsRgba(
+    const uint8x8_t yValues,
+    const int16x8_t uValues,
+    const int16x8_t vValues,
+    const bool bgra,
+    uint8_t* output)
+{
+    const int16x8_t y16 = vreinterpretq_s16_u16(vmovl_u8(yValues));
+
+    const int32x4_t yLow = vmovl_s16(vget_low_s16(y16));
+    const int32x4_t yHigh = vmovl_s16(vget_high_s16(y16));
+    const int32x4_t uLow = vmovl_s16(vget_low_s16(uValues));
+    const int32x4_t uHigh = vmovl_s16(vget_high_s16(uValues));
+    const int32x4_t vLow = vmovl_s16(vget_low_s16(vValues));
+    const int32x4_t vHigh = vmovl_s16(vget_high_s16(vValues));
+
+    const int32x4_t rLow = vaddq_s32(yLow, vshrq_n_s32(vmulq_n_s32(vLow, 91881), 16));
+    const int32x4_t rHigh = vaddq_s32(yHigh, vshrq_n_s32(vmulq_n_s32(vHigh, 91881), 16));
+    const int32x4_t gLow = vsubq_s32(yLow, vshrq_n_s32(vaddq_s32(vmulq_n_s32(uLow, 22554), vmulq_n_s32(vLow, 46802)), 16));
+    const int32x4_t gHigh = vsubq_s32(yHigh, vshrq_n_s32(vaddq_s32(vmulq_n_s32(uHigh, 22554), vmulq_n_s32(vHigh, 46802)), 16));
+    const int32x4_t bLow = vaddq_s32(yLow, vshrq_n_s32(vmulq_n_s32(uLow, 116130), 16));
+    const int32x4_t bHigh = vaddq_s32(yHigh, vshrq_n_s32(vmulq_n_s32(uHigh, 116130), 16));
+
+    const uint8x8_t rBytes = PackClampedBytes(rLow, rHigh);
+    const uint8x8_t gBytes = PackClampedBytes(gLow, gHigh);
+    const uint8x8_t bBytes = PackClampedBytes(bLow, bHigh);
+
+    uint8x8x4_t rgba;
+    if (bgra)
+    {
+        rgba.val[0] = bBytes;
+        rgba.val[1] = gBytes;
+        rgba.val[2] = rBytes;
+    }
+    else
+    {
+        rgba.val[0] = rBytes;
+        rgba.val[1] = gBytes;
+        rgba.val[2] = bBytes;
+    }
+
+    rgba.val[3] = vdup_n_u8(255);
+    vst4_u8(output, rgba);
+}
+#endif // CITHRUS_NEON_AVAILABLE
 }
 
 YuvToRgbaConverter::YuvToRgbaConverter(const uint16_t& frameWidth, const uint16_t& frameHeight, const std::string& format)
@@ -61,10 +118,17 @@ void YuvToRgbaConverter::Process()
     size_t inputSize = GetInputPin<0>().GetSize();
     const size_t expectedInputSize = outputFrameWidth_ * outputFrameHeight_ * 3 / 2;
 
-    if (!inputData || inputSize != expectedInputSize)
+    if (!inputData || inputSize == 0)
+    {
+        GetOutputPin<0>().SetData(nullptr);
+        GetOutputPin<0>().SetSize(0);
+        return;
+    }
+
+    if (inputSize != expectedInputSize)
     {
         static uint32_t sizeMismatchLogCount = 0;
-        if (inputData && inputSize > 0 && sizeMismatchLogCount < 10)
+        if (sizeMismatchLogCount < 10)
         {
             UE_LOG(
                 LogTemp,
@@ -76,21 +140,36 @@ void YuvToRgbaConverter::Process()
                 static_cast<uint32_t>(outputFrameHeight_));
             sizeMismatchLogCount++;
         }
+
+        GetOutputPin<0>().SetData(nullptr);
+        GetOutputPin<0>().SetSize(0);
         return;
     }
 
-#ifdef CITHRUS_SSE41_AVAILABLE
+#if defined(CITHRUS_NEON_AVAILABLE)
+    static bool loggedNeonPath = false;
+    if (!loggedNeonPath)
+    {
+        UE_LOG(LogTemp, Display, TEXT("YuvToRgbaConverter: Using NEON optimized path (ARM)."));
+        loggedNeonPath = true;
+    }
+
+    YuvToRgbaNeon(inputData, outputData_, outputFrameWidth_, outputFrameHeight_);
+#elif defined(CITHRUS_SSE41_AVAILABLE)
     YuvToRgbaSse41(inputData, &outputData_, outputFrameWidth_, outputFrameHeight_);
 #else
     static bool loggedScalarFallback = false;
     if (!loggedScalarFallback)
     {
-        UE_LOG(LogTemp, Log, TEXT("YuvToRgbaConverter: SSE4.1 unavailable, using scalar fallback."));
+        UE_LOG(LogTemp, Log, TEXT("YuvToRgbaConverter: SIMD unavailable, using scalar fallback."));
         loggedScalarFallback = true;
     }
 
     YuvToRgbaScalar(inputData, outputData_, outputFrameWidth_, outputFrameHeight_);
-#endif // CITHRUS_SSE41_AVAILABLE
+#endif // CITHRUS_NEON_AVAILABLE
+
+    GetOutputPin<0>().SetData(outputData_);
+    GetOutputPin<0>().SetSize(outputFrameWidth_ * outputFrameHeight_ * 4);
 }
 
 void YuvToRgbaConverter::YuvToRgbaSse41(const uint8_t* input, uint8_t** output, int width, int height)
@@ -233,6 +312,78 @@ void YuvToRgbaConverter::YuvToRgbaSse41(const uint8_t* input, uint8_t** output, 
     free(row_b);
 
 #endif // CITHRUS_SSE41_AVAILABLE
+}
+
+void YuvToRgbaConverter::YuvToRgbaNeon(const uint8_t* input, uint8_t* output, int width, int height)
+{
+#if defined(CITHRUS_NEON_AVAILABLE)
+    if (!input || !output || width <= 0 || height <= 0)
+    {
+        return;
+    }
+
+    const uint8_t* yPlane = input;
+    const uint8_t* uPlane = yPlane + (width * height);
+    const uint8_t* vPlane = uPlane + (width * height / 4);
+
+    const bool bgra = (GetOutputPin<0>().GetFormat() == "bgra");
+    const uint16x8_t chromaBias = vdupq_n_u16(128);
+
+    for (int y = 0; y < height; ++y)
+    {
+        const uint8_t* yRow = yPlane + (y * width);
+        const uint8_t* uRow = uPlane + ((y / 2) * (width / 2));
+        const uint8_t* vRow = vPlane + ((y / 2) * (width / 2));
+        uint8_t* outputRow = output + (y * width * 4);
+
+        int x = 0;
+        for (; x + 16 <= width; x += 16)
+        {
+            const uint8x16_t yValues = vld1q_u8(yRow + x);
+            const uint8x8_t uSamples = vld1_u8(uRow + (x >> 1));
+            const uint8x8_t vSamples = vld1_u8(vRow + (x >> 1));
+            const uint8x8x2_t uExpanded = vzip_u8(uSamples, uSamples);
+            const uint8x8x2_t vExpanded = vzip_u8(vSamples, vSamples);
+            const int16x8_t uLow = vreinterpretq_s16_u16(vsubq_u16(vmovl_u8(uExpanded.val[0]), chromaBias));
+            const int16x8_t uHigh = vreinterpretq_s16_u16(vsubq_u16(vmovl_u8(uExpanded.val[1]), chromaBias));
+            const int16x8_t vLow = vreinterpretq_s16_u16(vsubq_u16(vmovl_u8(vExpanded.val[0]), chromaBias));
+            const int16x8_t vHigh = vreinterpretq_s16_u16(vsubq_u16(vmovl_u8(vExpanded.val[1]), chromaBias));
+
+            StoreYuvBlockAsRgba(vget_low_u8(yValues), uLow, vLow, bgra, outputRow + (x * 4));
+            StoreYuvBlockAsRgba(vget_high_u8(yValues), uHigh, vHigh, bgra, outputRow + ((x + 8) * 4));
+        }
+
+        for (; x < width; ++x)
+        {
+            const int yIndex = y * width + x;
+            const int uvIndex = (y / 2) * (width / 2) + (x / 2);
+            const int Y = static_cast<int>(yPlane[yIndex]);
+            const int U = static_cast<int>(uPlane[uvIndex]) - 128;
+            const int V = static_cast<int>(vPlane[uvIndex]) - 128;
+            const uint8_t R = ClampByte(Y + ((91881 * V) >> 16));
+            const uint8_t G = ClampByte(Y - ((22554 * U + 46802 * V) >> 16));
+            const uint8_t B = ClampByte(Y + ((116130 * U) >> 16));
+            const int outIndex = yIndex * 4;
+
+            if (bgra)
+            {
+                output[outIndex + 0] = B;
+                output[outIndex + 1] = G;
+                output[outIndex + 2] = R;
+            }
+            else
+            {
+                output[outIndex + 0] = R;
+                output[outIndex + 1] = G;
+                output[outIndex + 2] = B;
+            }
+
+            output[outIndex + 3] = 255;
+        }
+    }
+#else
+    YuvToRgbaScalar(input, output, width, height);
+#endif // CITHRUS_NEON_AVAILABLE
 }
 
 void YuvToRgbaConverter::YuvToRgbaScalar(const uint8_t* input, uint8_t* output, int width, int height)

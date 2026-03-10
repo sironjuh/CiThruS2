@@ -15,10 +15,15 @@
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
+
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE
 
 #include "PipelineFilter.h"
 
+#include <atomic>
 #include <vector>
 
 enum class EHevcDecoderBackend : uint8;
@@ -56,7 +61,7 @@ protected:
 	bool useOpenHevc_;
 	bool backendConfigured_;
 	uint32_t openHevcErrorCount_;
-	uint32_t videoToolboxErrorCount_;
+	std::atomic<uint32_t> videoToolboxErrorCount_;
 
 #ifdef CITHRUS_OPENHEVC_AVAILABLE
 	OpenHevc_Handle handle_;
@@ -70,7 +75,8 @@ protected:
 	bool CacheParameterSet(const uint8_t* nalData, uint32_t nalSize, uint8_t nalType);
 	bool DecodeWithVideoToolboxSample(const uint8_t* sampleData, uint32_t sampleSize);
 	bool DecodeWithVideoToolboxNal(const uint8_t* nalData, uint32_t nalSize);
-	void HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuffer);
+	void DrainCompletedVideoToolboxFrames();
+	void HandleDecodedFrame(OSStatus status, CVImageBufferRef imageBuffer, void* sourceFrameRefCon);
 
 	static void DecompressionOutputCallback(
 		void* decompressionOutputRefCon,
@@ -81,14 +87,41 @@ protected:
 		CMTime presentationTimeStamp,
 		CMTime presentationDuration);
 
+	struct VideoToolboxDecodedFrame
+	{
+		std::vector<uint8_t> Data;
+		uint32_t Width = 0;
+		uint32_t Height = 0;
+	};
+
+	struct PendingDecodeContext
+	{
+		uint32_t SampleIndex = 0;
+	};
+
+	struct VideoToolboxCallbackState
+	{
+		std::mutex Mutex;
+		std::condition_variable Cv;
+		HevcDecoder* Decoder = nullptr;
+		uint32_t ActiveCallbacks = 0;
+	};
+
 	VTDecompressionSessionRef videoToolboxSession_;
 	CMVideoFormatDescriptionRef videoToolboxFormatDescription_;
+	VideoToolboxCallbackState* videoToolboxCallbackState_;
 
 	std::vector<uint8_t> vps_;
 	std::vector<uint8_t> sps_;
 	std::vector<uint8_t> pps_;
 	bool videoToolboxParameterSetsDirty_;
 	bool videoToolboxDecodedFrameReady_;
+	std::mutex videoToolboxQueueMutex_;
+	std::deque<VideoToolboxDecodedFrame> videoToolboxCompletedFrames_;
+	std::vector<uint8_t> videoToolboxPublishedFrame_;
+	uint32_t videoToolboxPendingDecodeCount_;
+	uint32_t videoToolboxDroppedFrameCount_;
+	uint32_t videoToolboxMaxPendingFrames_;
 
 	std::vector<uint8_t> videoToolboxPendingAuHvcc_;
 	bool videoToolboxPendingAuHasVcl_;
