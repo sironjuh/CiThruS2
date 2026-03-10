@@ -14,9 +14,13 @@
 
 class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
+class UUserWidget;
 class RenderTargetReader;
 class RenderTargetWriter;
 class AsyncPipelineRunner;
+class SBox;
+class SOverlay;
+struct FSlateBrush;
 
 UENUM(BlueprintType)
 enum class EHevcDecoderBackend : uint8
@@ -122,13 +126,31 @@ protected:
 	uint64_t startTimestampMs_;
 
 	bool wantsStop_ = false;
+	bool mainMenuWidgetClassLookupAttempted_ = false;
+	bool mainMenuWidgetObserved_ = false;
+	int32 previewLastRenderTargetWidth_ = 0;
+	int32 previewLastRenderTargetHeight_ = 0;
 
+	TWeakObjectPtr<UUserWidget> mainMenuWidget_;
+	UClass* mainMenuWidgetClass_ = nullptr;
+	TSharedPtr<SOverlay> previewOverlayWidget_;
+	TSharedPtr<SBox> previewBox_;
+	TSharedPtr<FSlateBrush> previewBrush_;
+
+	virtual void BeginPlay() override;
 	virtual void PostRegisterAllComponents() override;
 	virtual void EndPlay(const EEndPlayReason::Type endPlayReason) override;
 
 	bool StartStreams();
 	void DeleteStreams();
 	bool ResetStreams();
+
+	void CreatePreviewOverlay();
+	void DestroyPreviewOverlay();
+	void UpdatePreviewOverlay();
+	void UpdatePreviewOverlayDimensions();
+	UUserWidget* FindMainMenuWidget();
+	bool IsMainMenuOpen();
 
 	void StopTransmitInternal();
 	void Capture();

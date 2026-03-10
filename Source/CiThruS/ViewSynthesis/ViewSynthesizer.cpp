@@ -31,13 +31,29 @@
 #include "Misc/Debug.h"
 
 #include "RHI.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetBlueprintLibrary.h"
+#include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "ShaderParameterStruct.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "RenderResource.h"
+#include "Styling/SlateBrush.h"
+#include "Widgets/Images/SImage.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/SOverlay.h"
 
 #include <algorithm>
+
+namespace
+{
+constexpr TCHAR MAIN_MENU_WIDGET_CLASS_PATH[] = TEXT("/Game/UI/WBP_MainMenu.WBP_MainMenu_C");
+constexpr float PREVIEW_MARGIN = 16.0f;
+constexpr float PREVIEW_WIDTH = 320.0f;
+constexpr float MAIN_MENU_GRACE_PERIOD_SECONDS = 1.0f;
+}
 
 AViewSynthesizer::AViewSynthesizer()
 {
@@ -55,6 +71,13 @@ AViewSynthesizer::AViewSynthesizer()
     // Set this actor to call Tick() every frame
     PrimaryActorTick.bCanEverTick = true;
     //PrimaryActorTick.TickGroup = TG_PostUpdateWork;
+}
+
+void AViewSynthesizer::BeginPlay()
+{
+    Super::BeginPlay();
+
+    CreatePreviewOverlay();
 }
 
 void AViewSynthesizer::PostRegisterAllComponents()
@@ -84,6 +107,8 @@ void AViewSynthesizer::PostRegisterAllComponents()
 
 void AViewSynthesizer::EndPlay(const EEndPlayReason::Type endPlayReason)
 {
+    DestroyPreviewOverlay();
+
     Super::EndPlay(endPlayReason);
 
 	DeleteStreams();
@@ -92,6 +117,8 @@ void AViewSynthesizer::EndPlay(const EEndPlayReason::Type endPlayReason)
 void AViewSynthesizer::Tick(float deltaTime)
 {
 	Super::Tick(deltaTime);
+
+    UpdatePreviewOverlay();
 
     if (wantsStop_)
     {
@@ -161,6 +188,7 @@ bool AViewSynthesizer::StartStreams()
     frontRenderTarget_->ResizeTarget(frameWidth, frameHeight);
     rearRenderTarget_->ResizeTarget(frameWidth, frameHeight);
     resultRenderTarget_->ResizeTarget(frameWidth, frameHeight);
+    UpdatePreviewOverlayDimensions();
 
     try
     {
@@ -365,4 +393,167 @@ void AViewSynthesizer::Capture()
     }
 
     frameNumber_++;
+}
+
+void AViewSynthesizer::CreatePreviewOverlay()
+{
+    if (previewOverlayWidget_.IsValid() || !resultRenderTarget_ || !GetWorld() || !GetWorld()->IsGameWorld() || !GEngine || !GEngine->GameViewport)
+    {
+        return;
+    }
+
+    previewBrush_ = MakeShared<FSlateBrush>();
+    previewBrush_->SetResourceObject(resultRenderTarget_);
+    previewBrush_->DrawAs = ESlateBrushDrawType::Image;
+    previewBrush_->TintColor = FSlateColor(FLinearColor::White);
+
+    UpdatePreviewOverlayDimensions();
+
+    GEngine->GameViewport->AddViewportWidgetContent(
+        SAssignNew(previewOverlayWidget_, SOverlay)
+        + SOverlay::Slot()
+        .HAlign(HAlign_Left)
+        .VAlign(VAlign_Top)
+        .Padding(FMargin(PREVIEW_MARGIN))
+        [
+            SAssignNew(previewBox_, SBox)
+            .WidthOverride(previewBrush_->ImageSize.X)
+            .HeightOverride(previewBrush_->ImageSize.Y)
+            [
+                SNew(SImage)
+                .Image(previewBrush_.Get())
+            ]
+        ],
+        1);
+
+    if (previewOverlayWidget_.IsValid())
+    {
+        previewOverlayWidget_->SetVisibility(EVisibility::Collapsed);
+    }
+
+    UpdatePreviewOverlay();
+}
+
+void AViewSynthesizer::DestroyPreviewOverlay()
+{
+    if (!previewOverlayWidget_.IsValid())
+    {
+        return;
+    }
+
+    if (GEngine && GEngine->GameViewport)
+    {
+        GEngine->GameViewport->RemoveViewportWidgetContent(previewOverlayWidget_.ToSharedRef());
+    }
+
+    previewOverlayWidget_.Reset();
+    previewBox_.Reset();
+    previewBrush_.Reset();
+    previewLastRenderTargetWidth_ = 0;
+    previewLastRenderTargetHeight_ = 0;
+}
+
+void AViewSynthesizer::UpdatePreviewOverlay()
+{
+    if (!GetWorld() || !GetWorld()->IsGameWorld())
+    {
+        return;
+    }
+
+    if (!previewOverlayWidget_.IsValid())
+    {
+        CreatePreviewOverlay();
+    }
+
+    if (!previewOverlayWidget_.IsValid())
+    {
+        return;
+    }
+
+    UpdatePreviewOverlayDimensions();
+
+    previewOverlayWidget_->SetVisibility(IsMainMenuOpen() ? EVisibility::Collapsed : EVisibility::Visible);
+}
+
+void AViewSynthesizer::UpdatePreviewOverlayDimensions()
+{
+    if (!resultRenderTarget_ || !previewBrush_.IsValid())
+    {
+        return;
+    }
+
+    const int32 renderTargetWidth = resultRenderTarget_->SizeX;
+    const int32 renderTargetHeight = resultRenderTarget_->SizeY;
+
+    if (renderTargetWidth <= 0 || renderTargetHeight <= 0)
+    {
+        previewBrush_->ImageSize = FVector2D(PREVIEW_WIDTH, PREVIEW_WIDTH);
+
+        if (previewBox_.IsValid())
+        {
+            previewBox_->SetWidthOverride(PREVIEW_WIDTH);
+            previewBox_->SetHeightOverride(PREVIEW_WIDTH);
+        }
+
+        return;
+    }
+
+    if (renderTargetWidth == previewLastRenderTargetWidth_ && renderTargetHeight == previewLastRenderTargetHeight_)
+    {
+        return;
+    }
+
+    previewLastRenderTargetWidth_ = renderTargetWidth;
+    previewLastRenderTargetHeight_ = renderTargetHeight;
+
+    const float previewHeight = PREVIEW_WIDTH * static_cast<float>(renderTargetHeight) / static_cast<float>(renderTargetWidth);
+    previewBrush_->ImageSize = FVector2D(PREVIEW_WIDTH, previewHeight);
+
+    if (previewBox_.IsValid())
+    {
+        previewBox_->SetWidthOverride(PREVIEW_WIDTH);
+        previewBox_->SetHeightOverride(previewHeight);
+    }
+}
+
+UUserWidget* AViewSynthesizer::FindMainMenuWidget()
+{
+    if (mainMenuWidget_.IsValid())
+    {
+        return mainMenuWidget_.Get();
+    }
+
+    if (!mainMenuWidgetClassLookupAttempted_)
+    {
+        mainMenuWidgetClassLookupAttempted_ = true;
+        mainMenuWidgetClass_ = LoadClass<UUserWidget>(nullptr, MAIN_MENU_WIDGET_CLASS_PATH);
+    }
+
+    if (!mainMenuWidgetClass_)
+    {
+        return nullptr;
+    }
+
+    TArray<UUserWidget*> widgets;
+    UWidgetBlueprintLibrary::GetAllWidgetsOfClass(this, widgets, mainMenuWidgetClass_, false);
+
+    if (widgets.Num() <= 0)
+    {
+        return nullptr;
+    }
+
+    mainMenuWidgetObserved_ = true;
+    mainMenuWidget_ = widgets[0];
+
+    return widgets[0];
+}
+
+bool AViewSynthesizer::IsMainMenuOpen()
+{
+    if (UUserWidget* mainMenuWidget = FindMainMenuWidget())
+    {
+        return mainMenuWidget->IsInViewport() && mainMenuWidget->IsVisible();
+    }
+
+    return !mainMenuWidgetObserved_ && GetGameTimeSinceCreation() < MAIN_MENU_GRACE_PERIOD_SECONDS;
 }

@@ -192,6 +192,7 @@ public class CiThruS : ModuleRules
 		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "../../ThirdParty/"));
 
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "RHI", "RenderCore", "AIModule", "Landscape", "ChaosVehicles", "Niagara", "NiagaraCore" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "UMG" });
 		
 		if (Target.bBuildEditor)
 		{
