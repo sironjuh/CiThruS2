@@ -92,6 +92,9 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	bool dropFramesWhenBusy_ = true;
 
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	int maxReceiveViewFps_ = 30;
+
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Kvazaar Settings")
 	int overlappedWavefront_ = 3;
 

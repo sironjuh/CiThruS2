@@ -5,7 +5,7 @@
 #include "Engine/TextureRenderTarget2D.h"
 
 RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
-	: frameDirty_(false), initialized_(false), destroyed_(false)
+	: inputBuffer_(nullptr), texture_(nullptr), frameWidth_(0), frameHeight_(0), bytesPerPixel_(0), frameDirty_(false), initialized_(false), destroyed_(false)
 {
 	if (!texture)
 	{
@@ -36,6 +36,7 @@ RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
 	}
 
 	// Note that this is executed on the render thread later and not yet
+	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(InitializeReader)(
 		[this, texture](FRHICommandListImmediate& RHICmdList)
 		{
@@ -44,6 +45,7 @@ RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
 			if (destroyed_)
 			{
 				resourceMutex_.unlock();
+				EndRenderCommand();
 				return;
 			}
 
@@ -54,22 +56,29 @@ RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
 			initialized_ = true;
 
 			resourceMutex_.unlock();
+			EndRenderCommand();
 		});
 }
 
 RenderTargetWriter::~RenderTargetWriter()
 {
-	resourceMutex_.lock();
+	{
+		std::lock_guard<std::mutex> resourceLock(resourceMutex_);
+		destroyed_ = true;
+		initialized_ = false;
+	}
 
-	destroyed_ = true;
-	initialized_ = false;
+	{
+		std::unique_lock<std::mutex> renderCommandLock(renderCommandMutex_);
+		renderCommandCv_.wait(renderCommandLock, [this] { return pendingRenderCommandCount_ == 0; });
+	}
+
+	std::lock_guard<std::mutex> resourceLock(resourceMutex_);
 
 	delete[] inputBuffer_;
 	inputBuffer_ = nullptr;
 
 	texture_ = nullptr;
-
-	resourceMutex_.unlock();
 }
 
 void RenderTargetWriter::Process()
@@ -77,7 +86,7 @@ void RenderTargetWriter::Process()
 	const uint8_t* inputData = GetInputPin<0>().GetData();
 	uint32_t inputSize = GetInputPin<0>().GetSize();
 
-	if (!inputData || inputSize != frameWidth_ * frameHeight_ * bytesPerPixel_ || !initialized_)
+	if (!initialized_ || !inputData || inputSize != frameWidth_ * frameHeight_ * bytesPerPixel_)
 	{
 		return;
 	}
@@ -100,6 +109,7 @@ void RenderTargetWriter::Process()
 	writeMutex_.unlock();
 
 	// Note that this is executed on the render thread later and not yet
+	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(ExtractRenderTargets)(
 		[this](FRHICommandListImmediate& RHICmdList)
 		{
@@ -108,7 +118,7 @@ void RenderTargetWriter::Process()
 			if (!initialized_)
 			{
 				resourceMutex_.unlock();
-
+				EndRenderCommand();
 				return;
 			}
 
@@ -131,5 +141,25 @@ void RenderTargetWriter::Process()
 			writeMutex_.unlock();
 
 			resourceMutex_.unlock();
+			EndRenderCommand();
 		});
+}
+
+void RenderTargetWriter::BeginRenderCommand()
+{
+	std::lock_guard<std::mutex> renderCommandLock(renderCommandMutex_);
+	++pendingRenderCommandCount_;
+}
+
+void RenderTargetWriter::EndRenderCommand()
+{
+	std::lock_guard<std::mutex> renderCommandLock(renderCommandMutex_);
+	if (pendingRenderCommandCount_ > 0)
+	{
+		--pendingRenderCommandCount_;
+	}
+	if (pendingRenderCommandCount_ == 0)
+	{
+		renderCommandCv_.notify_all();
+	}
 }

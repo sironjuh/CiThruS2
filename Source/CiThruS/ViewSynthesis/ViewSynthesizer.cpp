@@ -11,6 +11,7 @@
 #include "Video/Pipeline/CsvLogger.h"
 #include "Video/Pipeline/HevcEncoder.h"
 #include "Video/Pipeline/HevcDecoder.h"
+#include "Video/Pipeline/FrameRateLimiter.h"
 #include "Video/Pipeline/Pipeline.h"
 #include "Video/Pipeline/SolidColorImageGenerator.h"
 #include "Video/Pipeline/RtpTransmitter.h"
@@ -288,6 +289,7 @@ bool AViewSynthesizer::StartStreams()
                         new ImageSequentialFilter(
                             {
                                 new HevcDecoder(16, hevcDecoderBackend_),
+                                new FrameRateLimiter(static_cast<uint32_t>(std::max(maxReceiveViewFps_, 0))),
                                 new YuvToRgbaConverter(frameWidth, frameHeight, "bgra"),
                                 //new BlinkDetector("stop.txt"),
                             }),

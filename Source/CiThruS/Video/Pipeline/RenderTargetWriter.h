@@ -5,8 +5,10 @@
 
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 
 class UTexture2D;
+class UTextureRenderTarget2D;
 
 // Writes data into RHI render targets in VRAM
 class CITHRUS_API RenderTargetWriter : public PipelineSink<1>
@@ -34,9 +36,15 @@ protected:
 
 	// Used to prevent resources from being deleted while they might still be in use on another thread
 	std::mutex resourceMutex_;
+	std::mutex renderCommandMutex_;
+	std::condition_variable renderCommandCv_;
+	uint32_t pendingRenderCommandCount_ = 0;
 
 	// These are separate because theoretically this object may get destroyed before being initialized,
 	// in which case the initialization needs to be cancelled
 	bool initialized_;
 	bool destroyed_;
+
+	void BeginRenderCommand();
+	void EndRenderCommand();
 };
