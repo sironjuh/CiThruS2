@@ -7,9 +7,12 @@
 #include "ShaderParameterUtils.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "StreamPerfStats.h"
+
+#include <chrono>
 
 RenderTargetReader::RenderTargetReader(std::vector<UTextureRenderTarget2D*> textures, const bool& depth, const float& depthRange)
-	: depth_(depth), depthRange_(depthRange), frameDirty_(false), flushNeeded_(false), bufferIndex_(0), initialized_(false), destroyed_(false)
+	: depth_(depth), depthRange_(depthRange), frameDirty_(false), flushNeeded_(false), extractQueued_(false), bufferIndex_(0), initialized_(false), destroyed_(false)
 {
 	frameBuffers_[0] = nullptr;
 	frameBuffers_[1] = nullptr;
@@ -65,6 +68,7 @@ RenderTargetReader::RenderTargetReader(std::vector<UTextureRenderTarget2D*> text
 	textures_.resize(textures.size(), nullptr);
 
 	// Note that this is executed on the render thread later and not yet
+	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(InitializeReader)(
 		[this, textures](FRHICommandListImmediate& RHICmdList)
 		{
@@ -72,6 +76,8 @@ RenderTargetReader::RenderTargetReader(std::vector<UTextureRenderTarget2D*> text
 
 			if (destroyed_)
 			{
+				lock.unlock();
+				EndRenderCommand();
 				return;
 			}
 
@@ -120,15 +126,32 @@ RenderTargetReader::RenderTargetReader(std::vector<UTextureRenderTarget2D*> text
 			frameBuffers_[1] = new uint8_t[outputSize]();
 
 			initialized_ = true;
+			lock.unlock();
+			EndRenderCommand();
 		});
 }
 
 RenderTargetReader::~RenderTargetReader()
 {
-	resourceMutex_.lock();
+	{
+		std::lock_guard<std::mutex> flushLock(flushMutex_);
+		flushNeeded_ = false;
+		extractQueued_ = false;
+	}
+	flushCv_.notify_all();
 
-	destroyed_ = true;
-	initialized_ = false;
+	{
+		std::lock_guard<std::mutex> resourceLock(resourceMutex_);
+		destroyed_ = true;
+		initialized_ = false;
+	}
+
+	{
+		std::unique_lock<std::mutex> renderCommandLock(renderCommandMutex_);
+		renderCommandCv_.wait(renderCommandLock, [this] { return pendingRenderCommandCount_ == 0; });
+	}
+
+	std::lock_guard<std::mutex> resourceLock(resourceMutex_);
 
 	textures_.clear();
 
@@ -157,18 +180,32 @@ RenderTargetReader::~RenderTargetReader()
 	delete[] queuedUserData_;
 
 	queuedUserData_ = nullptr;
+	queuedUserDataSize_ = 0;
 
 	GetOutputPin<0>().SetData(nullptr);
 	GetOutputPin<0>().SetSize(0);
 
 	GetOutputPin<1>().SetData(nullptr);
 	GetOutputPin<1>().SetSize(0);
-
-	resourceMutex_.unlock();
 }
 
 void RenderTargetReader::Process()
 {
+	bool shouldFlush = false;
+	{
+		std::lock_guard<std::mutex> lock(flushMutex_);
+		if (flushNeeded_ && !frameDirty_ && !extractQueued_)
+		{
+			extractQueued_ = true;
+			shouldFlush = true;
+		}
+	}
+
+	if (shouldFlush)
+	{
+		Flush();
+	}
+
 	{
 		std::unique_lock<std::mutex> lock(readMutex_);
 
@@ -198,6 +235,7 @@ void RenderTargetReader::Process()
 		std::lock_guard<std::mutex> lock(flushMutex_);
 
 		flushNeeded_ = false;
+		extractQueued_ = false;
 	}
 
 	flushCv_.notify_all();
@@ -205,25 +243,55 @@ void RenderTargetReader::Process()
 
 void RenderTargetReader::Read(uint8_t* userData, const uint32_t& userDataSize)
 {
+	QueueRead(userData, userDataSize, true);
+}
+
+bool RenderTargetReader::TryRead(uint8_t* userData, const uint32_t& userDataSize)
+{
+	return QueueRead(userData, userDataSize, false);
+}
+
+bool RenderTargetReader::IsBusy()
+{
+	std::lock_guard<std::mutex> lock(flushMutex_);
+	return flushNeeded_;
+}
+
+bool RenderTargetReader::QueueRead(uint8_t* userData, const uint32_t& userDataSize, bool waitIfBusy)
+{
 	{
 		std::unique_lock<std::mutex> lock(flushMutex_);
 
-		// Wait until the previous frame has been passed to the pipeline before processing more frames
 		if (flushNeeded_)
 		{
-			Flush();
+			if (!extractQueued_)
+			{
+				extractQueued_ = true;
+				Flush();
+			}
+
+			if (!waitIfBusy)
+			{
+				StreamPerfStats::AddReaderDrop();
+				return false;
+			}
+
+			flushCv_.wait(lock, [this] { return !flushNeeded_; });
 		}
 
-		flushCv_.wait(lock, [this] { return !flushNeeded_; });
-
 		flushNeeded_ = true;
+		extractQueued_ = false;
 	}
 
-	// Copy the user data so that it can be safely deleted by the caller of this function
+	delete[] queuedUserData_;
 	queuedUserData_ = new uint8_t[userDataSize];
 	queuedUserDataSize_ = userDataSize;
-	memcpy(queuedUserData_, userData, userDataSize);
+	if (userDataSize > 0)
+	{
+		memcpy(queuedUserData_, userData, userDataSize);
+	}
 
+	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(CopyBuffers)(
 		[this](FRHICommandListImmediate& RHICmdList)
 		{
@@ -239,15 +307,38 @@ void RenderTargetReader::Read(uint8_t* userData, const uint32_t& userDataSize)
 					std::lock_guard<std::mutex> flushLock(flushMutex_);
 
 					flushNeeded_ = false;
+					extractQueued_ = false;
 				}
 
 				flushCv_.notify_all();
-
+				EndRenderCommand();
 				return;
 			}
 
 			CopyToStagingBuffer(RHICmdList);
+			EndRenderCommand();
 		});
+
+	return true;
+}
+
+void RenderTargetReader::BeginRenderCommand()
+{
+	std::lock_guard<std::mutex> renderCommandLock(renderCommandMutex_);
+	++pendingRenderCommandCount_;
+}
+
+void RenderTargetReader::EndRenderCommand()
+{
+	std::lock_guard<std::mutex> renderCommandLock(renderCommandMutex_);
+	if (pendingRenderCommandCount_ > 0)
+	{
+		--pendingRenderCommandCount_;
+	}
+	if (pendingRenderCommandCount_ == 0)
+	{
+		renderCommandCv_.notify_all();
+	}
 }
 
 void RenderTargetReader::Flush()
@@ -257,6 +348,7 @@ void RenderTargetReader::Flush()
 	// ensure that the staging buffer is ready before ExtractStagingBuffer is
 	// called
 
+	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(ExtractRenderTargets)(
 		[this](FRHICommandListImmediate& RHICmdList)
 		{
@@ -268,6 +360,7 @@ void RenderTargetReader::Flush()
 					ExtractStagingBuffer(RHICmdList);
 				}
 			}
+			EndRenderCommand();
 		});
 }
 
@@ -379,6 +472,8 @@ void RenderTargetReader::ConvertDepth(FRHICommandListImmediate& RHICmdList) cons
 
 void RenderTargetReader::ExtractStagingBuffer(FRHICommandListImmediate& RHICmdList)
 {
+	auto readbackStart = std::chrono::high_resolution_clock::now();
+
 	// Read the contents of the staging texture
 	void* resource;
 	int32_t stagingBufferWidth;
@@ -424,6 +519,14 @@ void RenderTargetReader::ExtractStagingBuffer(FRHICommandListImmediate& RHICmdLi
 	}
 
 	RHICmdList.UnmapStagingSurface(stagingBuffer_);
+
+	{
+		std::lock_guard<std::mutex> lock(flushMutex_);
+		extractQueued_ = false;
+	}
+
+	auto readbackEnd = std::chrono::high_resolution_clock::now();
+	StreamPerfStats::AddReadbackSample(std::chrono::duration<double, std::milli>(readbackEnd - readbackStart).count());
 }
 
 void RenderTargetReader::CopyToStagingBuffer(FRHICommandListImmediate& RHICmdList)

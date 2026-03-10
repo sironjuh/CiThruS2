@@ -1,946 +1,1514 @@
 #include "HevcEncoder.h"
+
 #include "Misc/Debug.h"
+#include "StreamPerfStats.h"
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
 #include <thread>
+
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
 #include <CoreFoundation/CoreFoundation.h>
-#include <CoreVideo/CoreVideo.h>
 #include <CoreMedia/CoreMedia.h>
+#include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
-// Forward declaration for status decoding used in UE_LOG before its definition later in this file
-static const TCHAR* DecodeCVStatus(OSStatus s);
+static const TCHAR* DecodeCVStatus(OSStatus status);
 #endif
-
-
 
 const uint64_t KVAZAAR_FRAMERATE_DENOM = 90000;
 
-HevcEncoder::HevcEncoder(const uint16_t& frameWidth, const uint16_t& frameHeight, const uint8_t& threadCount, const uint8_t& qp, const uint8_t& wpp, const uint8_t& owf, const HevcEncoderPreset& preset)
-	: frameWidth_(frameWidth), frameHeight_(frameHeight), outputData_(nullptr), startTime_(std::chrono::high_resolution_clock::time_point::min())
-#ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-	, compressionSession_(nullptr), pixelBufferPool_(nullptr), frameCounter_(0), encodeComplete_(false)
-#endif
+namespace
 {
+	inline uint8_t ClampToByte(int value)
+	{
+		return static_cast<uint8_t>(std::min(std::max(value, 0), 255));
+	}
+
+	inline uint8_t RgbToY(uint8_t r, uint8_t g, uint8_t b)
+	{
+		return static_cast<uint8_t>((76 * r + 150 * g + 29 * b) >> 8);
+	}
+
+	inline uint8_t RgbToU(uint8_t r, uint8_t g, uint8_t b)
+	{
+		return ClampToByte(((-43 * r - 84 * g + 127 * b) >> 8) + 128);
+	}
+
+	inline uint8_t RgbToV(uint8_t r, uint8_t g, uint8_t b)
+	{
+		return ClampToByte(((127 * r - 106 * g - 21 * b) >> 8) + 128);
+	}
+
+	inline void LoadRgb(const uint8_t* pixel, bool isRGBA, uint8_t& r, uint8_t& g, uint8_t& b)
+	{
+		r = isRGBA ? pixel[0] : pixel[2];
+		g = pixel[1];
+		b = isRGBA ? pixel[2] : pixel[0];
+	}
+
+	void ConvertRgbInputToI420(const uint8_t* inputData, uint32_t width, uint32_t height, bool isRGBA, std::vector<uint8_t>& outputData)
+	{
+		outputData.resize(width * height * 3 / 2);
+		uint8_t* yPlane = outputData.data();
+		uint8_t* uPlane = yPlane + width * height;
+		uint8_t* vPlane = uPlane + (width * height / 4);
+
+		for (uint32_t y = 0; y < height; ++y)
+		{
+			const uint8_t* srcRow = inputData + (y * width * 4);
+			uint8_t* yRow = yPlane + (y * width);
+			for (uint32_t x = 0; x < width; ++x)
+			{
+				uint8_t r, g, b;
+				LoadRgb(srcRow + (x * 4), isRGBA, r, g, b);
+				yRow[x] = RgbToY(r, g, b);
+			}
+		}
+
+		for (uint32_t y = 0; y < height; y += 2)
+		{
+			const uint8_t* row0 = inputData + (y * width * 4);
+			const uint8_t* row1 = inputData + (std::min(y + 1, height - 1) * width * 4);
+			uint8_t* uRow = uPlane + ((y / 2) * (width / 2));
+			uint8_t* vRow = vPlane + ((y / 2) * (width / 2));
+
+			for (uint32_t x = 0; x < width; x += 2)
+			{
+				const uint32_t x1 = std::min(x + 1, width - 1);
+				uint8_t r00, g00, b00;
+				uint8_t r01, g01, b01;
+				uint8_t r10, g10, b10;
+				uint8_t r11, g11, b11;
+				LoadRgb(row0 + (x * 4), isRGBA, r00, g00, b00);
+				LoadRgb(row0 + (x1 * 4), isRGBA, r01, g01, b01);
+				LoadRgb(row1 + (x * 4), isRGBA, r10, g10, b10);
+				LoadRgb(row1 + (x1 * 4), isRGBA, r11, g11, b11);
+				const uint8_t r = static_cast<uint8_t>((r00 + r01 + r10 + r11 + 2) >> 2);
+				const uint8_t g = static_cast<uint8_t>((g00 + g01 + g10 + g11 + 2) >> 2);
+				const uint8_t b = static_cast<uint8_t>((b00 + b01 + b10 + b11 + 2) >> 2);
+				uRow[x / 2] = RgbToU(r, g, b);
+				vRow[x / 2] = RgbToV(r, g, b);
+			}
+		}
+	}
+
+	FString BackendToString(EHevcEncoderBackend backend)
+	{
+		switch (backend)
+		{
+		case EHevcEncoderBackend::Auto:
+			return TEXT("Auto");
+		case EHevcEncoderBackend::VideoToolbox:
+			return TEXT("VideoToolbox");
+		case EHevcEncoderBackend::Kvazaar:
+			return TEXT("Kvazaar");
+		default:
+			return TEXT("Unknown");
+		}
+	}
+
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-	// Create VideoToolbox compression session for HEVC encoding
-	CFMutableDictionaryRef encoderSpec = CFDictionaryCreateMutable(
-		kCFAllocatorDefault, 1,
-		&kCFTypeDictionaryKeyCallBacks,
-		&kCFTypeDictionaryValueCallBacks);
-	
-	CFDictionarySetValue(encoderSpec,
-		kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
-		kCFBooleanTrue);
-	
-	// Create pixel buffer attributes
-	CFMutableDictionaryRef pixelBufferAttrs = CFDictionaryCreateMutable(
-		kCFAllocatorDefault, 4,
-		&kCFTypeDictionaryKeyCallBacks,
-		&kCFTypeDictionaryValueCallBacks);
-	
-	CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth);
-	CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight);
-	// Prefer NV12 for VideoToolbox HW encoders
-	OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-	CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
-	// Ensure IOSurface-backed pixel buffers (required by VT on macOS/iOS)
-	CFMutableDictionaryRef ioSurfProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	
-	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferWidthKey, widthNum);
-	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferHeightKey, heightNum);
-	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferPixelFormatTypeKey, pixelFormatNum);
-	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps);
-	
-	CFRelease(widthNum);
-	CFRelease(heightNum);
-	CFRelease(pixelFormatNum);
-	CFRelease(ioSurfProps);
-
-	UE_LOG(LogTemp, Log, TEXT("HevcEncoder: VideoToolbox support compiled in"));
-	
-	// Create compression session
-	OSStatus status = VTCompressionSessionCreate(
-		kCFAllocatorDefault,
-		frameWidth,
-		frameHeight,
-		kCMVideoCodecType_HEVC,
-		encoderSpec,
-		pixelBufferAttrs,
-		kCFAllocatorDefault,
-		CompressionCallback,
-		this,
-		&compressionSession_);
-
-	// Log session creation
-	UE_LOG(LogTemp, Log, TEXT("VTCompressionSessionCreate returned status=%d, session=%p"), (int)status, compressionSession_);
-	
-	CFRelease(encoderSpec);
-	// Don't release pixelBufferAttrs yet - keep it until after PrepareToEncodeFrames
-	
-	if (status == noErr && compressionSession_)
+	FString PixelFormatToString(OSType pixelFormat)
 	{
-		useVideoToolbox_ = true;
-		// Set encoding properties based on preset
-		OSStatus propStatus = noErr;
-		// Low latency defaults
-		propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-		if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set RealTime: %d"), (int)propStatus); }
-		propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-		if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AllowFrameReordering: %d"), (int)propStatus); }
-
-		// Reduce internal buffering to minimize pool pressure
-		int32_t maxDelay = 1;
-		CFNumberRef maxDelayNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &maxDelay);
-		propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxFrameDelayCount, maxDelayNum);
-		CFRelease(maxDelayNum);
-		if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxFrameDelayCount: %d"), (int)propStatus); }
-
-		if (preset == HevcPresetMinimumLatency)
+		switch (pixelFormat)
 		{
-			// Set keyframe interval - VideoToolbox seems to ignore this sometimes, so we'll also force keyframes manually
-			int32_t gop = 30; // Back to 30 frames (~0.5s @60fps) - more efficient
-			CFNumberRef gopNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &gop);
-			propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxKeyFrameInterval, gopNum);
-			CFRelease(gopNum);
-			if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxKeyFrameInterval: %d"), (int)propStatus); }
-			
-			// Also set MaxKeyFrameIntervalDuration as backup
-			double gopDurationValue = 0.5; // 0.5 seconds
-			CFNumberRef gopDuration = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &gopDurationValue);
-			propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, gopDuration);
-			CFRelease(gopDuration);
-			if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxKeyFrameIntervalDuration: %d"), (int)propStatus); }
-			
-			// CRITICAL: Set a reasonable bitrate to keep frames RTP-friendly
-			// Calculate: target 2 Mbps for streaming (much lower than default)
-			int32_t targetBitrate = 2 * 1024 * 1024; // 2 Mbps
-			CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &targetBitrate);
-			propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
-			CFRelease(bitrateNum);
-			if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AverageBitRate: %d"), (int)propStatus); }
-			else { UE_LOG(LogTemp, Log, TEXT("VT: Set target bitrate to 2 Mbps for RTP streaming")); }
-			
-			// Also set data rate limits to enforce bitrate
-			int32_t dataRateLimits[2] = { targetBitrate / 8, 1 }; // bytes per second, duration
-			CFNumberRef dataRateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[0]);
-			CFNumberRef dataRateDuration = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[1]);
-			CFArrayRef dataRateLimitsArray = CFArrayCreate(kCFAllocatorDefault, (const void*[]){dataRateNum, dataRateDuration}, 2, &kCFTypeArrayCallBacks);
-			propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_DataRateLimits, dataRateLimitsArray);
-			CFRelease(dataRateNum);
-			CFRelease(dataRateDuration);
-			CFRelease(dataRateLimitsArray);
-			if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set DataRateLimits: %d"), (int)propStatus); }
-		}
-		else if (preset == HevcPresetLossless)
-		{
-			float qualityValue = 1.0f;
-			CFNumberRef qualityNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &qualityValue);
-			propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_Quality, qualityNum);
-			CFRelease(qualityNum);
-			if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set Quality: %d"), (int)propStatus); }
-		}
-		else
-		{
-			// Apply a rough bitrate based on QP (lower QP => higher bitrate)
-			if (qp > 0)
-			{
-				int32_t bitrate = (51 - qp) * frameWidth * frameHeight * 2; // Rough estimate
-				CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bitrate);
-				propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
-				CFRelease(bitrateNum);
-				if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AverageBitRate: %d"), (int)propStatus); }
-			}
-		}
-		
-		// Set profile level
-		propStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
-		if (propStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set ProfileLevel: %d"), (int)propStatus); }
-
-		// Provide expected frame rate hint (improves pacing & pool sizing)
-		int32_t expectedFps = 60;
-		CFNumberRef fpsNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &expectedFps);
-		OSStatus fpsStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_ExpectedFrameRate, fpsNum);
-		CFRelease(fpsNum);
-		if (fpsStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set ExpectedFrameRate: %d"), (int)fpsStatus); }
-
-		// Note: For HEVC, NALU length field size is dictated by format description; no property to force it.
-		// Prepare the session - this should allocate the internal pixel buffer pool
-		OSStatus prepStatus = VTCompressionSessionPrepareToEncodeFrames(compressionSession_);
-		if (prepStatus != noErr) { 
-			UE_LOG(LogTemp, Warning, TEXT("VT: PrepareToEncodeFrames failed: %d"), (int)prepStatus); 
-		}
-
-		// Now try to get the pixel buffer pool (owned by session)
-		pixelBufferPool_ = VTCompressionSessionGetPixelBufferPool(compressionSession_);
-		UE_LOG(LogTemp, Log, TEXT("HevcEncoder: After PrepareToEncodeFrames, PixelBufferPool=%p"), pixelBufferPool_);
-		
-		// Can release pixelBufferAttrs now
-		CFRelease(pixelBufferAttrs);
-
-		// If VT did not provide a pool (can happen on some OS/device combos), create our own
-		if (!pixelBufferPool_)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: VT did not provide a PixelBufferPool; creating a local pool."));
-			CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			CFNumberRef wNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth);
-			CFNumberRef hNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight);
-			OSType pf = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-			CFNumberRef pfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
-			CFMutableDictionaryRef ioSurfProps2 = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, wNum);
-			CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, hNum);
-			CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pfNum);
-			CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps2);
-
-			CFMutableDictionaryRef poolOpts = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			int32_t minBufs = 6;
-			CFNumberRef minBufsNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &minBufs);
-			CFDictionarySetValue(poolOpts, kCVPixelBufferPoolMinimumBufferCountKey, minBufsNum);
-
-			OSStatus poolStatus = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolOpts, attrs, &pixelBufferPool_);
-			CFRelease(minBufsNum);
-			CFRelease(poolOpts);
-			CFRelease(wNum); CFRelease(hNum); CFRelease(pfNum); CFRelease(ioSurfProps2); CFRelease(attrs);
-
-			if (poolStatus == kCVReturnSuccess && pixelBufferPool_)
-			{
-				ownPixelBufferPool_ = true;
-				// Optionally warm the pool
-				CVPixelBufferRef warm[4] = {nullptr,nullptr,nullptr,nullptr};
-				for (int i = 0; i < 4; ++i)
-				{
-					if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pixelBufferPool_, &warm[i]) != kCVReturnSuccess) { warm[i] = nullptr; break; }
-				}
-				for (int i = 0; i < 4; ++i) { if (warm[i]) CVPixelBufferRelease(warm[i]); }
-				UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Created local PixelBufferPool=%p"), pixelBufferPool_);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Failed to create local PixelBufferPool (status=%d)"), (int)poolStatus);
-			}
+		case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+			return TEXT("NV12 FullRange");
+		case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+			return TEXT("NV12 VideoRange");
+		case kCVPixelFormatType_420YpCbCr8Planar:
+			return TEXT("I420 Planar");
+#ifdef kCVPixelFormatType_420YpCbCr8PlanarFullRange
+		case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+			return TEXT("I420 FullRange");
+#endif
+		case kCVPixelFormatType_32BGRA:
+			return TEXT("BGRA");
+		default:
+			return FString::Printf(TEXT("0x%x"), static_cast<unsigned>(pixelFormat));
 		}
 	}
-#elif defined(CITHRUS_KVAZAAR_AVAILABLE)
-	// Set up Kvazaar for encoding
-	kvazaarConfig_ = kvazaarApi_->config_alloc();
+#endif
+}
 
-	kvazaarApi_->config_init(kvazaarConfig_);
-	kvazaarApi_->config_parse(kvazaarConfig_, "threads", std::to_string(threadCount).c_str());
-	//kvazaarApi_->config_parse(kvazaarConfig_, "force-level", "4");
-	//kvazaarApi_->config_parse(kvazaarConfig_, "intra_period", "16");
-	//kvazaar_api->config_parse(kvazaarConfig_, "period", "64");
-	//kvazaar_api->config_parse(kvazaarConfig_, "tiles", "3x3");
-	//kvazaar_api->config_parse(kvazaarConfig_, "slices", "tiles");
-	//kvazaar_api->config_parse(kvazaarConfig_, "mv-constraint", "frametilemargin");
-	//kvazaar_api->config_parse(kvazaarConfig_, "slices", "wpp");
+EHevcEncoderBackend HevcEncoder::ResolveBackend(const EHevcEncoderBackend& requestedBackend)
+{
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	const bool canUseVideoToolbox = true;
+#else
+	const bool canUseVideoToolbox = false;
+#endif
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+	const bool canUseKvazaar = true;
+#else
+	const bool canUseKvazaar = false;
+#endif
 
-	switch (preset)
+	switch (requestedBackend)
 	{
-	case HevcPresetMinimumLatency:
-		kvazaarApi_->config_parse(kvazaarConfig_, "preset", "ultrafast");
-		kvazaarApi_->config_parse(kvazaarConfig_, "gop", "lp-g8d1t1");
-		kvazaarApi_->config_parse(kvazaarConfig_, "vps-period", "16");
-		//kvazaarApi_->config_parse(kvazaarConfig_, "repeat-headers", "1"); // VPS/SPS/PPS before every keyframe
-		//kvazaarApi_->config_parse(kvazaarConfig_, "vps-period", "1");
+	case EHevcEncoderBackend::VideoToolbox:
+		if (canUseVideoToolbox)
+		{
+			return EHevcEncoderBackend::VideoToolbox;
+		}
+		return canUseKvazaar ? EHevcEncoderBackend::Kvazaar : EHevcEncoderBackend::Auto;
 
-		kvazaarConfig_->qp = qp;
-		kvazaarConfig_->wpp = wpp;
-		kvazaarConfig_->owf = owf;
-		//kvazaarConfig_->bipred = 0;
-		//kvazaarConfig_->intra_period = 16;
-		break;
+	case EHevcEncoderBackend::Kvazaar:
+		if (canUseKvazaar)
+		{
+			return EHevcEncoderBackend::Kvazaar;
+		}
+		return canUseVideoToolbox ? EHevcEncoderBackend::VideoToolbox : EHevcEncoderBackend::Auto;
 
-	case HevcPresetLossless:
-		kvazaarConfig_->lossless = 1;
-		break;
+	case EHevcEncoderBackend::Auto:
+	default:
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+		if (canUseVideoToolbox && IsHardwareVideoToolboxAvailable())
+		{
+			return EHevcEncoderBackend::VideoToolbox;
+		}
+#endif
+		if (canUseKvazaar)
+		{
+			return EHevcEncoderBackend::Kvazaar;
+		}
+		return canUseVideoToolbox ? EHevcEncoderBackend::VideoToolbox : EHevcEncoderBackend::Auto;
 	}
+}
 
-	kvazaarConfig_->width = frameWidth;
-	kvazaarConfig_->height = frameHeight;
-	kvazaarConfig_->hash = KVZ_HASH_NONE;
-	//kvazaarConfig_->framerate_num = 30;  //1
-	//kvazaarConfig_->framerate_denom = 1; //KVAZAAR_FRAMERATE_DENOM;
-
-	kvazaarConfig_->aud_enable = 0;
-	kvazaarConfig_->calc_psnr = 0;
-
-	kvazaarEncoder_ = kvazaarApi_->encoder_open(kvazaarConfig_);
-	kvazaarTransmitPicture_ = kvazaarApi_->picture_alloc(frameWidth_, frameHeight_);
-#endif // CITHRUS_KVAZAAR_AVAILABLE
-
-	GetInputPin<0>().SetAcceptedFormat("yuv420");
+HevcEncoder::HevcEncoder(
+	const uint16_t& frameWidth,
+	const uint16_t& frameHeight,
+	const uint8_t& threadCount,
+	const uint8_t& qp,
+	const uint8_t& wpp,
+	const uint8_t& owf,
+	const HevcEncoderPreset& preset,
+	const EHevcEncoderBackend& requestedBackend,
+	const float& targetBitrateMbps,
+	const uint32_t& maxKeyFrameInterval,
+	const uint32_t& expectedFrameRate,
+	const uint32_t& perfLogInterval,
+	const uint32_t& maxPendingFrames)
+	: frameWidth_(frameWidth)
+	, frameHeight_(frameHeight)
+	, outputData_(nullptr)
+	, startTime_(std::chrono::high_resolution_clock::time_point::min())
+	, requestedBackend_(requestedBackend)
+	, selectedBackend_(EHevcEncoderBackend::Auto)
+	, preset_(preset)
+	, threadCount_(threadCount)
+	, qp_(qp)
+	, wpp_(wpp)
+	, owf_(owf)
+	, targetBitrateMbps_(targetBitrateMbps)
+	, maxKeyFrameInterval_(std::max<uint32_t>(1, maxKeyFrameInterval))
+	, expectedFrameRate_(std::max<uint32_t>(1, expectedFrameRate))
+	, perfLogInterval_(std::max<uint32_t>(1, perfLogInterval))
+	, maxPendingFrames_(std::max<uint32_t>(2, maxPendingFrames))
+	, perfFramesAccumulated_(0)
+	, droppedFrames_(0)
+{
+	GetInputPin<0>().SetAcceptedFormats({ "yuv420", "rgba", "bgra" });
 	GetOutputPin<0>().SetFormat("hevc");
+
+	const EHevcEncoderBackend preferredBackend = ResolveBackend(requestedBackend_);
+
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	if (preferredBackend == EHevcEncoderBackend::VideoToolbox)
+	{
+		const bool requireHardware = (requestedBackend_ == EHevcEncoderBackend::Auto);
+		if (InitializeVideoToolbox(requireHardware))
+		{
+			return;
+		}
+	}
+#endif
+
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+	if (preferredBackend == EHevcEncoderBackend::Kvazaar || requestedBackend_ == EHevcEncoderBackend::Auto)
+	{
+		if (InitializeKvazaar())
+		{
+			return;
+		}
+	}
+#endif
+
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	if (!useVideoToolbox_ && InitializeVideoToolbox(false))
+	{
+		return;
+	}
+#endif
+
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+	if (!kvazaarEncoder_ && InitializeKvazaar())
+	{
+		return;
+	}
+#endif
+
+	UE_LOG(LogTemp, Error, TEXT("HevcEncoder: No HEVC encoder backend could be initialized"));
 }
 
 HevcEncoder::~HevcEncoder()
 {
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-	if (compressionSession_)
-	{
-		VTCompressionSessionInvalidate(compressionSession_);
-		CFRelease(compressionSession_);
-		compressionSession_ = nullptr;
-	}
-	// Release local pool if we created one
-	if (pixelBufferPool_ && ownPixelBufferPool_)
-	{
-		CVPixelBufferPoolRelease(pixelBufferPool_);
-		pixelBufferPool_ = nullptr;
-	}
-	// pixelBufferPool_ provided by VT is owned by the session
-#elif defined(CITHRUS_KVAZAAR_AVAILABLE)
-	kvazaarApi_->config_destroy(kvazaarConfig_);
-	kvazaarApi_->encoder_close(kvazaarEncoder_);
-	kvazaarApi_->picture_free(kvazaarTransmitPicture_);
+	ShutdownVideoToolbox();
+#endif
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+	ShutdownKvazaar();
+#endif
+	ClearOutputFrame();
+}
 
-	kvazaarConfig_ = nullptr;
-	kvazaarEncoder_ = nullptr;
-	kvazaarTransmitPicture_ = nullptr;
-#endif // CITHRUS_KVAZAAR_AVAILABLE
-
+void HevcEncoder::ClearOutputFrame()
+{
 	delete[] outputData_;
 	outputData_ = nullptr;
+	GetOutputPin<0>().SetData(nullptr);
+	GetOutputPin<0>().SetSize(0);
+}
+
+void HevcEncoder::PublishOutputFrame(const std::vector<uint8_t>& frameData)
+{
+	ClearOutputFrame();
+	if (frameData.empty())
+	{
+		return;
+	}
+
+	outputData_ = new uint8_t[frameData.size()];
+	memcpy(outputData_, frameData.data(), frameData.size());
+	GetOutputPin<0>().SetData(outputData_);
+	GetOutputPin<0>().SetSize(static_cast<uint32_t>(frameData.size()));
+}
+
+FString HevcEncoder::BackendName() const
+{
+	return BackendToString(selectedBackend_);
 }
 
 void HevcEncoder::Process()
 {
 	const uint8_t* inputData = GetInputPin<0>().GetData();
-	uint32_t inputSize = GetInputPin<0>().GetSize();
+	const uint32_t inputSize = GetInputPin<0>().GetSize();
+	const std::string inputFormat = GetInputPin<0>().GetFormat();
 
-	if (!inputData || inputSize == 0)
+	if (inputData && inputSize > 0 && startTime_ == std::chrono::high_resolution_clock::time_point::min())
+	{
+		startTime_ = std::chrono::high_resolution_clock::now();
+	}
+
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	if (selectedBackend_ == EHevcEncoderBackend::VideoToolbox)
+	{
+		DrainCompletedVideoToolboxFrames();
+		if (inputData && inputSize > 0)
+		{
+			EncodeWithVideoToolbox(inputData, inputSize, inputFormat);
+		}
+		LogPerformanceIfNeeded();
+		return;
+	}
+#endif
+
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+	if (selectedBackend_ == EHevcEncoderBackend::Kvazaar)
+	{
+		if (!inputData || inputSize == 0 || !EncodeWithKvazaar(inputData, inputSize, inputFormat))
+		{
+			ClearOutputFrame();
+		}
+		return;
+	}
+#endif
+
+	ClearOutputFrame();
+}
+
+void HevcEncoder::LogPerformanceIfNeeded()
+{
+#if defined(CITHRUS_VIDEOTOOLBOX_AVAILABLE) && PLATFORM_MAC
+	if (selectedBackend_ != EHevcEncoderBackend::VideoToolbox)
 	{
 		return;
 	}
 
-	std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
-
-	if (startTime_ == std::chrono::high_resolution_clock::time_point::min())
+	uint32_t perfFrames = 0;
+	double avgAllocMs = 0.0;
+	double avgConvertMs = 0.0;
+	double avgEncodeMs = 0.0;
+	uint32_t pendingFrames = 0;
+	uint64_t droppedFrames = 0;
 	{
-		startTime_ = now;
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (perfFramesAccumulated_ < perfLogInterval_)
+		{
+			return;
+		}
+
+		perfFrames = perfFramesAccumulated_;
+		avgAllocMs = vtAllocSamples_ > 0 ? (vtAllocMsTotal_ / static_cast<double>(vtAllocSamples_)) : 0.0;
+		avgConvertMs = vtConvertSamples_ > 0 ? (vtConvertMsTotal_ / static_cast<double>(vtConvertSamples_)) : 0.0;
+		avgEncodeMs = vtEncodeSamples_ > 0 ? (vtEncodeMsTotal_ / static_cast<double>(vtEncodeSamples_)) : 0.0;
+		pendingFrames = pendingEncodeCount_;
+		droppedFrames = droppedFrames_;
+
+		perfFramesAccumulated_ = 0;
+		vtAllocSamples_ = 0;
+		vtConvertSamples_ = 0;
+		vtEncodeSamples_ = 0;
+		vtAllocMsTotal_ = 0.0;
+		vtConvertMsTotal_ = 0.0;
+		vtEncodeMsTotal_ = 0.0;
+		droppedFrames_ = 0;
+		droppedCompletedFrames_ = 0;
+	}
+
+	const FStreamPerfSnapshot snapshot = StreamPerfStats::Consume();
+	const uint64_t totalDroppedFrames = droppedFrames + snapshot.ReaderDroppedFrames + snapshot.RtpDroppedFrames;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("HevcEncoder PERF [%s hw=%d frames=%u]: readback=%.2fms convert=%.2fms pixelBuffer=%.2fms encode=%.2fms rtp=%.2fms pending=%u dropped=%llu"),
+		*BackendName(),
+		usingHardwareVideoToolbox_ ? 1 : 0,
+		perfFrames,
+		snapshot.ReadbackMs,
+		avgConvertMs,
+		avgAllocMs,
+		avgEncodeMs,
+		snapshot.RtpSendMs,
+		pendingFrames,
+		static_cast<unsigned long long>(totalDroppedFrames));
+#endif
+}
+
+#ifdef CITHRUS_KVAZAAR_AVAILABLE
+bool HevcEncoder::InitializeKvazaar()
+{
+	if (!kvazaarApi_)
+	{
+		return false;
+	}
+
+	kvazaarConfig_ = kvazaarApi_->config_alloc();
+	if (!kvazaarConfig_)
+	{
+		return false;
+	}
+
+	kvazaarApi_->config_init(kvazaarConfig_);
+	kvazaarApi_->config_parse(kvazaarConfig_, "threads", std::to_string(threadCount_).c_str());
+
+	switch (preset_)
+	{
+	case HevcPresetMinimumLatency:
+		kvazaarApi_->config_parse(kvazaarConfig_, "preset", "ultrafast");
+		kvazaarApi_->config_parse(kvazaarConfig_, "gop", "lp-g8d1t1");
+		kvazaarApi_->config_parse(kvazaarConfig_, "vps-period", "16");
+		kvazaarConfig_->qp = qp_;
+		kvazaarConfig_->wpp = wpp_;
+		kvazaarConfig_->owf = owf_;
+		break;
+
+	case HevcPresetLossless:
+		kvazaarConfig_->lossless = 1;
+		break;
+
+	default:
+		kvazaarConfig_->qp = qp_;
+		kvazaarConfig_->wpp = wpp_;
+		kvazaarConfig_->owf = owf_;
+		break;
+	}
+
+	kvazaarConfig_->width = frameWidth_;
+	kvazaarConfig_->height = frameHeight_;
+	kvazaarConfig_->hash = KVZ_HASH_NONE;
+	kvazaarConfig_->aud_enable = 0;
+	kvazaarConfig_->calc_psnr = 0;
+
+	kvazaarEncoder_ = kvazaarApi_->encoder_open(kvazaarConfig_);
+	if (!kvazaarEncoder_)
+	{
+		ShutdownKvazaar();
+		return false;
+	}
+
+	kvazaarTransmitPicture_ = kvazaarApi_->picture_alloc(frameWidth_, frameHeight_);
+	if (!kvazaarTransmitPicture_)
+	{
+		ShutdownKvazaar();
+		return false;
+	}
+
+	selectedBackend_ = EHevcEncoderBackend::Kvazaar;
+	UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Using Kvazaar backend"));
+	return true;
+}
+
+void HevcEncoder::ShutdownKvazaar()
+{
+	if (kvazaarTransmitPicture_)
+	{
+		kvazaarApi_->picture_free(kvazaarTransmitPicture_);
+		kvazaarTransmitPicture_ = nullptr;
+	}
+
+	if (kvazaarEncoder_)
+	{
+		kvazaarApi_->encoder_close(kvazaarEncoder_);
+		kvazaarEncoder_ = nullptr;
+	}
+
+	if (kvazaarConfig_)
+	{
+		kvazaarApi_->config_destroy(kvazaarConfig_);
+		kvazaarConfig_ = nullptr;
+	}
+}
+
+bool HevcEncoder::EncodeWithKvazaar(const uint8_t* inputData, uint32_t inputSize, const std::string& inputFormat)
+{
+	if (!kvazaarEncoder_ || !kvazaarTransmitPicture_)
+	{
+		return false;
 	}
 
 	const uint8_t* yuvFrame = inputData;
+	if (inputFormat == "bgra" || inputFormat == "rgba")
+	{
+		ConvertRgbInputToI420(inputData, frameWidth_, frameHeight_, inputFormat == "rgba", kvazaarScratchBuffer_);
+		yuvFrame = kvazaarScratchBuffer_.data();
+		inputSize = static_cast<uint32_t>(kvazaarScratchBuffer_.size());
+	}
+
+	const uint32_t expectedSize = frameWidth_ * frameHeight_ * 3 / 2;
+	if (!yuvFrame || inputSize < expectedSize)
+	{
+		return false;
+	}
+
+	memcpy(kvazaarTransmitPicture_->y, yuvFrame, frameWidth_ * frameHeight_);
+	yuvFrame += frameWidth_ * frameHeight_;
+	memcpy(kvazaarTransmitPicture_->u, yuvFrame, frameWidth_ * frameHeight_ / 4);
+	yuvFrame += frameWidth_ * frameHeight_ / 4;
+	memcpy(kvazaarTransmitPicture_->v, yuvFrame, frameWidth_ * frameHeight_ / 4);
+
+	kvz_frame_info frameInfo;
+	kvz_data_chunk* dataOut = nullptr;
+	uint32_t lenOut = 0;
+	kvazaarApi_->encoder_encode(kvazaarEncoder_, kvazaarTransmitPicture_, &dataOut, &lenOut, nullptr, nullptr, &frameInfo);
+
+	if (!dataOut)
+	{
+		return false;
+	}
+
+	std::vector<uint8_t> encodedFrame(lenOut);
+	uint8_t* dataPtr = encodedFrame.data();
+	for (kvz_data_chunk* chunk = dataOut; chunk != nullptr; chunk = chunk->next)
+	{
+		memcpy(dataPtr, chunk->data, chunk->len);
+		dataPtr += chunk->len;
+	}
+
+	kvazaarApi_->chunk_free(dataOut);
+	kvazaarApi_->picture_free(kvazaarTransmitPicture_);
+	kvazaarTransmitPicture_ = kvazaarApi_->picture_alloc(frameWidth_, frameHeight_);
+
+	PublishOutputFrame(encodedFrame);
+	return kvazaarTransmitPicture_ != nullptr;
+}
+#endif // CITHRUS_KVAZAAR_AVAILABLE
 
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-	if (useVideoToolbox_ && compressionSession_)
+bool HevcEncoder::SupportsVideoToolbox()
+{
+#if PLATFORM_MAC
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool HevcEncoder::IsHardwareVideoToolboxAvailable()
+{
+#if !PLATFORM_MAC
+	return false;
+#else
+	CFMutableDictionaryRef encoderSpec = CFDictionaryCreateMutable(
+		kCFAllocatorDefault,
+		2,
+		&kCFTypeDictionaryKeyCallBacks,
+		&kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+
+	CFMutableDictionaryRef pixelBufferAttrs = CFDictionaryCreateMutable(
+		kCFAllocatorDefault,
+		3,
+		&kCFTypeDictionaryKeyCallBacks,
+		&kCFTypeDictionaryValueCallBacks);
+	int32_t width = 64;
+	int32_t height = 64;
+	CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &width);
+	CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &height);
+	CFMutableDictionaryRef ioSurfProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferWidthKey, widthNum);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferHeightKey, heightNum);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps);
+	CFRelease(widthNum);
+	CFRelease(heightNum);
+	CFRelease(ioSurfProps);
+
+	VTCompressionSessionRef session = nullptr;
+	const OSStatus createStatus = VTCompressionSessionCreate(
+		kCFAllocatorDefault,
+		width,
+		height,
+		kCMVideoCodecType_HEVC,
+		encoderSpec,
+		pixelBufferAttrs,
+		kCFAllocatorDefault,
+		nullptr,
+		nullptr,
+		&session);
+
+	CFRelease(pixelBufferAttrs);
+	CFRelease(encoderSpec);
+
+	if (createStatus != noErr || !session)
 	{
-		auto frameStartTime = std::chrono::high_resolution_clock::now();
-		CVPixelBufferRef pixelBuffer = nullptr;
-		
-		// Always create pixel buffers manually to avoid pool allocation threshold issues
-		// This is more reliable than depending on VT's internal pool behavior
-		auto bufferCreateStart = std::chrono::high_resolution_clock::now();
-		CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		CFNumberRef wNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth_);
-		CFNumberRef hNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight_);
-		OSType pf = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange; // NV12 full range
-		CFNumberRef pfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
-		CFMutableDictionaryRef ioSurfProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, wNum);
-		CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, hNum);
-		CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pfNum);
-		CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps);
+		return false;
+	}
 
-		OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, frameWidth_, frameHeight_, pf, attrs, &pixelBuffer);
-		CFRelease(wNum); CFRelease(hNum); CFRelease(pfNum); CFRelease(ioSurfProps); CFRelease(attrs);
-		
-		auto bufferCreateEnd = std::chrono::high_resolution_clock::now();
-		auto bufferCreateMs = std::chrono::duration<double, std::milli>(bufferCreateEnd - bufferCreateStart).count();
-		
-		if (status != kCVReturnSuccess || !pixelBuffer)
+	bool usingHardware = false;
+	CFTypeRef usingHardwareValue = nullptr;
+	if (VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kCFAllocatorDefault, &usingHardwareValue) == noErr && usingHardwareValue)
+	{
+		if (CFGetTypeID(usingHardwareValue) == CFBooleanGetTypeID())
 		{
-			UE_LOG(LogTemp, Error, TEXT("HevcEncoder: CVPixelBufferCreate failed status=%d (%s)"), (int)status, DecodeCVStatus(status));
-			GetOutputPin<0>().SetData(nullptr); GetOutputPin<0>().SetSize(0);
-			return;
+			usingHardware = CFBooleanGetValue(static_cast<CFBooleanRef>(usingHardwareValue));
 		}
+		CFRelease(usingHardwareValue);
+	}
 
-		// Convert YUV data (I420) to pixel buffer
-		auto conversionStart = std::chrono::high_resolution_clock::now();
-		if (!ConvertYUVToPixelBuffer(yuvFrame, pixelBuffer))
-		{
-			UE_LOG(LogTemp, Error, TEXT("HevcEncoder: ConvertYUVToPixelBuffer failed"));
-			CVPixelBufferRelease(pixelBuffer);
-			GetOutputPin<0>().SetData(nullptr); GetOutputPin<0>().SetSize(0);
-			return;
-		}
-		auto conversionEnd = std::chrono::high_resolution_clock::now();
-		auto conversionMs = std::chrono::duration<double, std::milli>(conversionEnd - conversionStart).count();
-		
-		// Prepare presentation timestamp
-		CMTime presentationTime = CMTimeMake(frameCounter_, 60); // 60 fps timebase
-		CMTime duration = CMTimeMake(1, 60);
-		
-		// Force a keyframe every 30 frames (VideoToolbox sometimes ignores MaxKeyFrameInterval)
-		// Also force first frame to be a keyframe
-		CFDictionaryRef frameProperties = NULL;
-		bool forceKeyframe = (frameCounter_ == 0 || frameCounter_ % 30 == 0);
-		if (forceKeyframe)
-		{
-			CFStringRef keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
-			CFBooleanRef values[] = { kCFBooleanTrue };
-			frameProperties = CFDictionaryCreate(kCFAllocatorDefault, 
-				(const void**)keys, (const void**)values, 1,
-				&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-			//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Forcing keyframe at frame %lld"), frameCounter_);
-		}
-		
-		frameCounter_++;
-		
-		// Reset synchronization
-		{
-			std::lock_guard<std::mutex> lock(encodeMutex_);
-			encodeComplete_ = false;
-			encodedData_.clear();
-		}
-		
-		// Encode the frame
-		auto encodeStart = std::chrono::high_resolution_clock::now();
-		VTEncodeInfoFlags encodeInfoFlags = 0;
-		OSStatus encodeStatus = VTCompressionSessionEncodeFrame(
-			compressionSession_,
-			pixelBuffer,
-			presentationTime,
-			duration,
-			frameProperties,
-			NULL,
-			&encodeInfoFlags);
-		
-		if (frameProperties)
-		{
-			CFRelease(frameProperties);
-		}
-		
-		CVPixelBufferRelease(pixelBuffer);
-		
-		if (encodeStatus != noErr)
-		{
-			UE_LOG(LogTemp, Error, TEXT("VTCompressionSessionEncodeFrame failed: %d"), (int)encodeStatus);
-			GetOutputPin<0>().SetData(nullptr);
-			GetOutputPin<0>().SetSize(0);
-			return;
-		}
+	VTCompressionSessionInvalidate(session);
+	CFRelease(session);
+	return usingHardware;
+#endif
+}
 
-		if ((encodeInfoFlags & kVTEncodeInfo_FrameDropped) != 0)
+bool HevcEncoder::InitializeVideoToolbox(bool requireHardware)
+{
+#if !PLATFORM_MAC
+	return false;
+#else
+	if (!SupportsVideoToolbox())
+	{
+		return false;
+	}
+
+	CFMutableDictionaryRef encoderSpec = CFDictionaryCreateMutable(
+		kCFAllocatorDefault,
+		2,
+		&kCFTypeDictionaryKeyCallBacks,
+		&kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+	if (requireHardware)
+	{
+		CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+	}
+
+	CFMutableDictionaryRef pixelBufferAttrs = CFDictionaryCreateMutable(
+		kCFAllocatorDefault,
+		3,
+		&kCFTypeDictionaryKeyCallBacks,
+		&kCFTypeDictionaryValueCallBacks);
+	CFMutableDictionaryRef ioSurfProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth_);
+	CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight_);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferWidthKey, widthNum);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferHeightKey, heightNum);
+	CFDictionarySetValue(pixelBufferAttrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps);
+	CFRelease(widthNum);
+	CFRelease(heightNum);
+	CFRelease(ioSurfProps);
+
+	if (!callbackState_)
+	{
+		callbackState_ = new VideoToolboxCallbackState();
+	}
+
+	{
+		std::lock_guard<std::mutex> callbackLock(callbackState_->Mutex);
+		callbackState_->Encoder = this;
+		callbackState_->ActiveCallbacks = 0;
+	}
+
+	const OSStatus status = VTCompressionSessionCreate(
+		kCFAllocatorDefault,
+		frameWidth_,
+		frameHeight_,
+		kCMVideoCodecType_HEVC,
+		encoderSpec,
+		pixelBufferAttrs,
+		kCFAllocatorDefault,
+		CompressionCallback,
+		callbackState_,
+		&compressionSession_);
+
+	CFRelease(pixelBufferAttrs);
+	CFRelease(encoderSpec);
+
+	if (status != noErr || !compressionSession_)
+	{
+		if (callbackState_)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: VT reported frame dropped"));
+			delete callbackState_;
+			callbackState_ = nullptr;
 		}
-		
-		// Wait for encoding to complete (synchronous behavior)
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: VTCompressionSessionCreate failed status=%d"), static_cast<int>(status));
+		return false;
+	}
+
+	OSStatus propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set RealTime: %d"), static_cast<int>(propertyStatus)); }
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AllowFrameReordering: %d"), static_cast<int>(propertyStatus)); }
+	int32_t maxDelay = 1;
+	CFNumberRef maxDelayNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &maxDelay);
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxFrameDelayCount, maxDelayNum);
+	CFRelease(maxDelayNum);
+	if (propertyStatus != noErr && propertyStatus != kVTPropertyNotSupportedErr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxFrameDelayCount: %d"), static_cast<int>(propertyStatus));
+	}
+
+	int32_t gop = static_cast<int32_t>(maxKeyFrameInterval_);
+	CFNumberRef gopNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &gop);
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxKeyFrameInterval, gopNum);
+	CFRelease(gopNum);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxKeyFrameInterval: %d"), static_cast<int>(propertyStatus)); }
+
+	double gopDurationValue = static_cast<double>(maxKeyFrameInterval_) / static_cast<double>(expectedFrameRate_);
+	CFNumberRef gopDuration = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &gopDurationValue);
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, gopDuration);
+	CFRelease(gopDuration);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set MaxKeyFrameIntervalDuration: %d"), static_cast<int>(propertyStatus)); }
+
+	if (preset_ == HevcPresetLossless)
+	{
+		float qualityValue = 1.0f;
+		CFNumberRef qualityNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &qualityValue);
+		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_Quality, qualityNum);
+		CFRelease(qualityNum);
+		if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set Quality: %d"), static_cast<int>(propertyStatus)); }
+	}
+	else
+	{
+		int32_t targetBitrate = static_cast<int32_t>(std::max(0.1f, targetBitrateMbps_) * 1024.0f * 1024.0f);
+		CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &targetBitrate);
+		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
+		CFRelease(bitrateNum);
+		if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AverageBitRate: %d"), static_cast<int>(propertyStatus)); }
+
+		int32_t dataRateLimits[2] = { targetBitrate / 8, 1 };
+		CFNumberRef dataRateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[0]);
+		CFNumberRef dataRateDuration = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[1]);
+		const void* limitValues[] = { dataRateNum, dataRateDuration };
+		CFArrayRef dataRateLimitsArray = CFArrayCreate(kCFAllocatorDefault, limitValues, 2, &kCFTypeArrayCallBacks);
+		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_DataRateLimits, dataRateLimitsArray);
+		CFRelease(dataRateNum);
+		CFRelease(dataRateDuration);
+		CFRelease(dataRateLimitsArray);
+		if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set DataRateLimits: %d"), static_cast<int>(propertyStatus)); }
+	}
+
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set ProfileLevel: %d"), static_cast<int>(propertyStatus)); }
+
+	int32_t expectedFps = static_cast<int32_t>(expectedFrameRate_);
+	CFNumberRef fpsNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &expectedFps);
+	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_ExpectedFrameRate, fpsNum);
+	CFRelease(fpsNum);
+	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set ExpectedFrameRate: %d"), static_cast<int>(propertyStatus)); }
+
+	const OSStatus prepareStatus = VTCompressionSessionPrepareToEncodeFrames(compressionSession_);
+	if (prepareStatus != noErr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("VT: PrepareToEncodeFrames failed: %d"), static_cast<int>(prepareStatus));
+	}
+
+	CFTypeRef usingHardwareValue = nullptr;
+	if (VTSessionCopyProperty(compressionSession_, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kCFAllocatorDefault, &usingHardwareValue) == noErr && usingHardwareValue)
+	{
+		if (CFGetTypeID(usingHardwareValue) == CFBooleanGetTypeID())
 		{
-			std::unique_lock<std::mutex> lock(encodeMutex_);
-			encodeCv_.wait(lock, [this] { return encodeComplete_; });
+			usingHardwareVideoToolbox_ = CFBooleanGetValue(static_cast<CFBooleanRef>(usingHardwareValue));
 		}
-		
-		auto encodeEnd = std::chrono::high_resolution_clock::now();
-		auto encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
-		
-		auto frameEndTime = std::chrono::high_resolution_clock::now();
-		auto totalFrameMs = std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count();
-		
-		// Copy encoded data to output buffer
-		delete[] outputData_;
-		
-		if (encodedData_.empty())
+		CFRelease(usingHardwareValue);
+	}
+
+	if (requireHardware && !usingHardwareVideoToolbox_)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Auto backend requested hardware VT but session is not hardware-backed"));
+		ShutdownVideoToolbox();
+		return false;
+	}
+
+	CFTypeRef pixelBufferAttributesValue = nullptr;
+	if (VTSessionCopyProperty(compressionSession_, kVTCompressionPropertyKey_VideoEncoderPixelBufferAttributes, kCFAllocatorDefault, &pixelBufferAttributesValue) == noErr && pixelBufferAttributesValue)
+	{
+		if (CFGetTypeID(pixelBufferAttributesValue) == CFDictionaryGetTypeID())
 		{
-			outputData_ = nullptr;
-			GetOutputPin<0>().SetData(nullptr);
-			GetOutputPin<0>().SetSize(0);
-			UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Encoded frame empty"));
+			vtPixelBufferAttributes_ = CFDictionaryCreateCopy(kCFAllocatorDefault, static_cast<CFDictionaryRef>(pixelBufferAttributesValue));
 		}
-		else
+		CFRelease(pixelBufferAttributesValue);
+	}
+
+	if (!vtPixelBufferAttributes_)
+	{
+		CFMutableDictionaryRef fallbackAttrs = CFDictionaryCreateMutable(
+			kCFAllocatorDefault,
+			4,
+			&kCFTypeDictionaryKeyCallBacks,
+			&kCFTypeDictionaryValueCallBacks);
+		CFNumberRef widthFallback = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth_);
+		CFNumberRef heightFallback = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight_);
+		CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &vtPixelFormat_);
+		CFMutableDictionaryRef fallbackIoSurface = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionarySetValue(fallbackAttrs, kCVPixelBufferWidthKey, widthFallback);
+		CFDictionarySetValue(fallbackAttrs, kCVPixelBufferHeightKey, heightFallback);
+		CFDictionarySetValue(fallbackAttrs, kCVPixelBufferPixelFormatTypeKey, pixelFormatNum);
+		CFDictionarySetValue(fallbackAttrs, kCVPixelBufferIOSurfacePropertiesKey, fallbackIoSurface);
+		CFRelease(widthFallback);
+		CFRelease(heightFallback);
+		CFRelease(pixelFormatNum);
+		CFRelease(fallbackIoSurface);
+		vtPixelBufferAttributes_ = fallbackAttrs;
+	}
+
+	if (vtPixelBufferAttributes_)
+	{
+		CFTypeRef pixelFormatValue = CFDictionaryGetValue(vtPixelBufferAttributes_, kCVPixelBufferPixelFormatTypeKey);
+		if (pixelFormatValue)
 		{
-			outputData_ = new uint8_t[encodedData_.size()];
-			memcpy(outputData_, encodedData_.data(), encodedData_.size());
-			GetOutputPin<0>().SetData(outputData_);
-			GetOutputPin<0>().SetSize(static_cast<uint32_t>(encodedData_.size()));
-			
-			// Log performance metrics every 30 frames to track encoding speed
-			static uint32_t perfFrameCount = 0;
-			static double totalBufCreate = 0, totalConversion = 0, totalEncode = 0, totalFrame = 0;
-			totalBufCreate += bufferCreateMs;
-			totalConversion += conversionMs;
-			totalEncode += encodeMs;
-			totalFrame += totalFrameMs;
-			perfFrameCount++;
-			
-			if (perfFrameCount % 30 == 0)
+			if (CFGetTypeID(pixelFormatValue) == CFNumberGetTypeID())
 			{
-				double avgBufCreate = totalBufCreate / 30.0;
-				double avgConversion = totalConversion / 30.0;
-				double avgEncode = totalEncode / 30.0;
-				double avgTotal = totalFrame / 30.0;
-				double fps = 1000.0 / avgTotal;
-				
-				//UE_LOG(LogTemp, Log, TEXT("HevcEncoder PERF (30 frames avg): BufCreate=%.2fms, YUVConv=%.2fms, Encode=%.2fms, Total=%.2fms (%.1f fps, %d bytes)"), 
-				//	avgBufCreate, avgConversion, avgEncode, avgTotal, fps, (int)encodedData_.size());
-				
-				// Reset accumulators
-				totalBufCreate = totalConversion = totalEncode = totalFrame = 0;
+				CFNumberGetValue(static_cast<CFNumberRef>(pixelFormatValue), kCFNumberSInt32Type, &vtPixelFormat_);
+			}
+			else if (CFGetTypeID(pixelFormatValue) == CFArrayGetTypeID() && CFArrayGetCount(static_cast<CFArrayRef>(pixelFormatValue)) > 0)
+			{
+				CFTypeRef firstFormatValue = CFArrayGetValueAtIndex(static_cast<CFArrayRef>(pixelFormatValue), 0);
+				if (firstFormatValue && CFGetTypeID(firstFormatValue) == CFNumberGetTypeID())
+				{
+					CFNumberGetValue(static_cast<CFNumberRef>(firstFormatValue), kCFNumberSInt32Type, &vtPixelFormat_);
+				}
 			}
 		}
 	}
-#elif defined(CITHRUS_KVAZAAR_AVAILABLE)
+
+	if (!EnsureVideoToolboxPixelBufferPool())
 	{
-		memcpy(kvazaarTransmitPicture_->y, yuvFrame, frameWidth_ * frameHeight_);
-		yuvFrame += frameWidth_ * frameHeight_;
-		memcpy(kvazaarTransmitPicture_->u, yuvFrame, frameWidth_ * frameHeight_ / 4);
-		yuvFrame += frameWidth_ * frameHeight_ / 4;
-		memcpy(kvazaarTransmitPicture_->v, yuvFrame, frameWidth_ * frameHeight_ / 4);
-
-		// TODO: Something about this doesn't work, causes choppy video. Probably dts since it affects the decoding
-		/*kvazaarTransmitPicture_->pts = ((now - startTime_).count() * KVAZAAR_FRAMERATE_DENOM) / 1000000000ll;
-		kvazaarTransmitPicture_->dts = kvazaarTransmitPicture_->pts;*/
-
-		kvz_frame_info frame_info;
-		kvz_data_chunk* data_out = nullptr;
-		uint32_t len_out = 0;
-
-		kvazaarApi_->encoder_encode(kvazaarEncoder_, kvazaarTransmitPicture_,
-			&data_out, &len_out,
-			nullptr, nullptr,
-			&frame_info);
-
-		delete[] outputData_;
-
-		if (!data_out)
-		{
-			outputData_ = nullptr;
-
-			GetOutputPin<0>().SetData(outputData_);
-			GetOutputPin<0>().SetSize(0);
-
-			return;
-		}
-
-		outputData_ = new uint8_t[len_out];
-		uint8_t* data_ptr = outputData_;
-
-		for (kvz_data_chunk* chunk = data_out; chunk != nullptr; chunk = chunk->next)
-		{
-			memcpy(data_ptr, chunk->data, chunk->len);
-			data_ptr += chunk->len;
-		}
-
-		kvazaarApi_->chunk_free(data_out);
-
-		kvazaarApi_->picture_free(kvazaarTransmitPicture_);
-		kvazaarTransmitPicture_ = kvazaarApi_->picture_alloc(frameWidth_, frameHeight_);
-
-		GetOutputPin<0>().SetData(outputData_);
-		GetOutputPin<0>().SetSize(len_out);
+		ShutdownVideoToolbox();
+		return false;
 	}
-#else
+
+	useVideoToolbox_ = true;
+	selectedBackend_ = EHevcEncoderBackend::VideoToolbox;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("HevcEncoder: Using VideoToolbox backend (hardware=%d, pixelFormat=%s, bitrate=%.2f Mbps, gop=%u, fps=%u)"),
+		usingHardwareVideoToolbox_ ? 1 : 0,
+		*PixelFormatToString(vtPixelFormat_),
+		targetBitrateMbps_,
+		maxKeyFrameInterval_,
+		expectedFrameRate_);
+	return true;
+#endif
+}
+
+void HevcEncoder::ShutdownVideoToolbox()
+{
+	VideoToolboxCallbackState* callbackState = callbackState_;
+	if (callbackState)
 	{
-		GetOutputPin<0>().SetData(nullptr);
-		GetOutputPin<0>().SetSize(0);
+		std::lock_guard<std::mutex> callbackLock(callbackState->Mutex);
+		callbackState->Encoder = nullptr;
 	}
-#endif // CITHRUS_KVAZAAR_AVAILABLE
-}
 
-#ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-
-// ============================================================================
-// HEVC NAL Unit Inspection Helpers
-// ============================================================================
-
-// Detect if buffer starts with Annex-B start code (0x000001 or 0x00000001)
-static bool StartsWithAnnexB(const uint8_t* p, size_t n)
-{
-	if (n >= 4 && p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x01)
-		return true;
-	if (n >= 3 && p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01)
-		return true;
-	return false;
-}
-
-// Find next Annex-B start code in buffer, return offset or -1 if not found
-static int FindNextStartCode(const uint8_t* p, int start, int end)
-{
-	for (int i = start; i < end - 2; ++i)
+	if (compressionSession_)
 	{
-		if (p[i] == 0x00 && p[i+1] == 0x00)
-		{
-			if (p[i+2] == 0x01)
-				return i; // 3-byte start code
-			if (i < end - 3 && p[i+2] == 0x00 && p[i+3] == 0x01)
-				return i; // 4-byte start code
-		}
+		VTCompressionSessionCompleteFrames(compressionSession_, kCMTimeInvalid);
+		VTCompressionSessionInvalidate(compressionSession_);
+		CFRelease(compressionSession_);
+		compressionSession_ = nullptr;
 	}
-	return -1;
-}
 
-// Extract HEVC NAL unit type from NAL header (bits 1-6 of first byte)
-static uint8_t HevcNalType(const uint8_t* nalu, size_t nalu_len)
-{
-	if (nalu_len < 1) return 0xFF;
-	return (nalu[0] & 0x7E) >> 1;
-}
-
-// Get human-readable name for HEVC NAL unit type
-static FString NalTypeName(uint8_t t)
-{
-	switch (t)
+	if (callbackState)
 	{
-	case 0: return TEXT("TRAIL_N");
-	case 1: return TEXT("TRAIL_R");
-	case 2: return TEXT("TSA_N");
-	case 3: return TEXT("TSA_R");
-	case 4: return TEXT("STSA_N");
-	case 5: return TEXT("STSA_R");
-	case 6: return TEXT("RADL_N");
-	case 7: return TEXT("RADL_R");
-	case 8: return TEXT("RASL_N");
-	case 9: return TEXT("RASL_R");
-	case 16: return TEXT("BLA_W_LP");
-	case 17: return TEXT("BLA_W_RADL");
-	case 18: return TEXT("BLA_N_LP");
-	case 19: return TEXT("IDR_W_RADL");
-	case 20: return TEXT("IDR_N_LP");
-	case 21: return TEXT("CRA_NUT");
-	case 32: return TEXT("VPS");
-	case 33: return TEXT("SPS");
-	case 34: return TEXT("PPS");
-	case 35: return TEXT("AUD");
-	case 36: return TEXT("EOS_NUT");
-	case 37: return TEXT("EOB_NUT");
-	case 38: return TEXT("FD_NUT");
-	case 39: return TEXT("PREFIX_SEI");
-	case 40: return TEXT("SUFFIX_SEI");
-	default: return FString::Printf(TEXT("TYPE_%d"), t);
+		std::unique_lock<std::mutex> callbackLock(callbackState->Mutex);
+		const bool drained = callbackState->Cv.wait_for(
+			callbackLock,
+			std::chrono::milliseconds(500),
+			[callbackState] { return callbackState->ActiveCallbacks == 0; });
+		if (!drained)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Timed out waiting for VideoToolbox callbacks to drain"));
+		}
+		callbackLock.unlock();
+		delete callbackState;
+		callbackState_ = nullptr;
 	}
-}
 
-// Parse and log Annex-B access unit details
-static void LogAnnexBAU(const uint8_t* data, size_t size)
-{
-	if (!data || size == 0) return;
-	
-	int nalCount = 0;
-	bool hasVPS = false, hasSPS = false, hasPPS = false, hasIDR = false;
-	int offset = 0;
-	
-	while (offset < (int)size)
 	{
-		// Find start code
-		int scLen = 0;
-		if (offset + 3 <= (int)size && data[offset] == 0x00 && data[offset+1] == 0x00 && data[offset+2] == 0x01)
-			scLen = 3;
-		else if (offset + 4 <= (int)size && data[offset] == 0x00 && data[offset+1] == 0x00 && data[offset+2] == 0x00 && data[offset+3] == 0x01)
-			scLen = 4;
-		else
-			break; // No valid start code
-		
-		int nalStart = offset + scLen;
-		int nextSc = FindNextStartCode(data, nalStart, (int)size);
-		int nalEnd = (nextSc >= 0) ? nextSc : (int)size;
-		int nalSize = nalEnd - nalStart;
-		
-		if (nalSize > 0)
-		{
-			uint8_t nalType = HevcNalType(data + nalStart, nalSize);
-			FString nalName = NalTypeName(nalType);
-			
-			if (nalType == 32) hasVPS = true;
-			else if (nalType == 33) hasSPS = true;
-			else if (nalType == 34) hasPPS = true;
-			else if (nalType == 19 || nalType == 20) hasIDR = true;
-			
-			//UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
-			//	nalCount, nalType, *nalName, nalSize);
-			nalCount++;
-		}
-		
-		offset = nalEnd;
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		completedFrames_.clear();
+		pendingEncodeCount_ = 0;
 	}
-	
-	//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: AU size=%d, keyframe=%d (VPS=%d SPS=%d PPS=%d IDR=%d), NALs=%d"),
-	//	(int)size, hasIDR ? 1 : 0, hasVPS ? 1 : 0, hasSPS ? 1 : 0, hasPPS ? 1 : 0, hasIDR ? 1 : 0, nalCount);
+
+	if (pixelBufferPool_ && ownPixelBufferPool_)
+	{
+		CVPixelBufferPoolRelease(pixelBufferPool_);
+	}
+	pixelBufferPool_ = nullptr;
+	ownPixelBufferPool_ = false;
+
+	if (vtPixelBufferAttributes_)
+	{
+		CFRelease(vtPixelBufferAttributes_);
+		vtPixelBufferAttributes_ = nullptr;
+	}
+
+	useVideoToolbox_ = false;
+	usingHardwareVideoToolbox_ = false;
 }
 
-// Parse and log length-prefixed (HVCC) access unit details
-static void LogHvccAU(const uint8_t* data, size_t size, int naluLengthSize)
+bool HevcEncoder::CreateFallbackPixelBufferPool()
 {
-	if (!data || size == 0) return;
-	
-	int nalCount = 0;
-	bool hasVPS = false, hasSPS = false, hasPPS = false, hasIDR = false;
-	size_t offset = 0;
-	
-	while (offset + naluLengthSize <= size)
+	CFMutableDictionaryRef attrs = vtPixelBufferAttributes_
+		? CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, vtPixelBufferAttributes_)
+		: CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (!attrs)
 	{
-		uint32_t naluLength = 0;
-		if (naluLengthSize == 4)
+		return false;
+	}
+
+	CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameWidth_);
+	CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &frameHeight_);
+	CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &vtPixelFormat_);
+	CFMutableDictionaryRef ioSurfProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, widthNum);
+	CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, heightNum);
+	CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pixelFormatNum);
+	CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, ioSurfProps);
+	CFRelease(widthNum);
+	CFRelease(heightNum);
+	CFRelease(pixelFormatNum);
+	CFRelease(ioSurfProps);
+
+	CFMutableDictionaryRef poolOptions = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int32_t minimumBuffers = static_cast<int32_t>(maxPendingFrames_ + 1);
+	CFNumberRef minimumBuffersNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &minimumBuffers);
+	CFDictionarySetValue(poolOptions, kCVPixelBufferPoolMinimumBufferCountKey, minimumBuffersNum);
+
+	const CVReturn poolStatus = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolOptions, attrs, &pixelBufferPool_);
+	CFRelease(minimumBuffersNum);
+	CFRelease(poolOptions);
+	CFRelease(attrs);
+
+	if (poolStatus != kCVReturnSuccess || !pixelBufferPool_)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Failed to create fallback pixel buffer pool status=%d (%s)"), static_cast<int>(poolStatus), DecodeCVStatus(poolStatus));
+		pixelBufferPool_ = nullptr;
+		return false;
+	}
+
+	ownPixelBufferPool_ = true;
+	for (uint32_t i = 0; i < maxPendingFrames_; ++i)
+	{
+		CVPixelBufferRef warmBuffer = nullptr;
+		if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pixelBufferPool_, &warmBuffer) != kCVReturnSuccess)
 		{
-			naluLength = (data[offset] << 24) | (data[offset+1] << 16) |
-						 (data[offset+2] << 8) | data[offset+3];
-		}
-		else if (naluLengthSize == 2)
-		{
-			naluLength = (data[offset] << 8) | data[offset+1];
-		}
-		else if (naluLengthSize == 1)
-		{
-			naluLength = data[offset];
-		}
-		
-		offset += naluLengthSize;
-		
-		if (naluLength == 0 || offset + naluLength > size)
 			break;
-		
-		uint8_t nalType = HevcNalType(data + offset, naluLength);
-		FString nalName = NalTypeName(nalType);
-		
-		if (nalType == 32) hasVPS = true;
-		else if (nalType == 33) hasSPS = true;
-		else if (nalType == 34) hasPPS = true;
-		else if (nalType == 19 || nalType == 20) hasIDR = true;
-		
-		//UE_LOG(LogTemp, Log, TEXT("  NAL #%d: type=%d (%s), size=%d"),
-		//	nalCount, nalType, *nalName, (int)naluLength);
-		nalCount++;
-		
-		offset += naluLength;
+		}
+		CVPixelBufferRelease(warmBuffer);
 	}
-	
-	UE_LOG(LogTemp, Log, TEXT("HevcEncoder: AU size=%d (HVCC length-prefixed, %d-byte), keyframe=%d (VPS=%d SPS=%d PPS=%d IDR=%d), NALs=%d"),
-		(int)size, naluLengthSize, hasIDR ? 1 : 0, hasVPS ? 1 : 0, hasSPS ? 1 : 0, hasPPS ? 1 : 0, hasIDR ? 1 : 0, nalCount);
+
+	return true;
 }
 
-void HevcEncoder::CompressionCallback(void* outputCallbackRefCon,
+bool HevcEncoder::EnsureVideoToolboxPixelBufferPool()
+{
+	if (pixelBufferPool_)
+	{
+		return true;
+	}
+
+	pixelBufferPool_ = VTCompressionSessionGetPixelBufferPool(compressionSession_);
+	if (pixelBufferPool_)
+	{
+		ownPixelBufferPool_ = false;
+		return true;
+	}
+
+	return CreateFallbackPixelBufferPool();
+}
+
+bool HevcEncoder::ConvertInputToPixelBuffer(const uint8_t* inputData, uint32_t inputSize, const std::string& inputFormat, CVPixelBufferRef pixelBuffer)
+{
+	if (!inputData || !pixelBuffer)
+	{
+		return false;
+	}
+
+	const bool isRGBA = (inputFormat == "rgba");
+	const bool isRGBInput = (inputFormat == "bgra" || inputFormat == "rgba");
+	const bool isYuvInput = (inputFormat == "yuv420");
+	const uint32_t expectedRgbSize = frameWidth_ * frameHeight_ * 4;
+	const uint32_t expectedYuvSize = frameWidth_ * frameHeight_ * 3 / 2;
+	if ((isRGBInput && inputSize < expectedRgbSize) || (isYuvInput && inputSize < expectedYuvSize))
+	{
+		return false;
+	}
+
+	const CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+	if (lockStatus != kCVReturnSuccess)
+	{
+		return false;
+	}
+
+	const OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+	bool ok = true;
+
+	if (isYuvInput)
+	{
+		const uint8_t* srcY = inputData;
+		const uint8_t* srcU = srcY + (frameWidth_ * frameHeight_);
+		const uint8_t* srcV = srcU + (frameWidth_ * frameHeight_ / 4);
+
+		if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+		{
+			uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
+			uint8_t* uvPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+			size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+			size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+
+			for (uint32_t row = 0; row < frameHeight_; ++row)
+			{
+				memcpy(yPlane + row * yStride, srcY + row * frameWidth_, frameWidth_);
+			}
+			for (uint32_t row = 0; row < frameHeight_ / 2; ++row)
+			{
+				uint8_t* dst = uvPlane + row * uvStride;
+				const uint8_t* uRow = srcU + row * (frameWidth_ / 2);
+				const uint8_t* vRow = srcV + row * (frameWidth_ / 2);
+				for (uint32_t col = 0; col < frameWidth_ / 2; ++col)
+				{
+					dst[2 * col + 0] = uRow[col];
+					dst[2 * col + 1] = vRow[col];
+				}
+			}
+		}
+		else if (fmt == kCVPixelFormatType_420YpCbCr8Planar
+#ifdef kCVPixelFormatType_420YpCbCr8PlanarFullRange
+			|| fmt == kCVPixelFormatType_420YpCbCr8PlanarFullRange
+#endif
+		)
+		{
+			uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
+			uint8_t* uPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+			uint8_t* vPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 2));
+			size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+			size_t uStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+			size_t vStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 2);
+
+			for (uint32_t row = 0; row < frameHeight_; ++row)
+			{
+				memcpy(yPlane + (row * yStride), srcY + (row * frameWidth_), frameWidth_);
+			}
+			for (uint32_t row = 0; row < frameHeight_ / 2; ++row)
+			{
+				memcpy(uPlane + (row * uStride), srcU + (row * frameWidth_ / 2), frameWidth_ / 2);
+				memcpy(vPlane + (row * vStride), srcV + (row * frameWidth_ / 2), frameWidth_ / 2);
+			}
+		}
+		else
+		{
+			ok = false;
+		}
+	}
+	else if (isRGBInput)
+	{
+		if (fmt == kCVPixelFormatType_32BGRA)
+		{
+			uint8_t* dst = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pixelBuffer));
+			const size_t dstStride = CVPixelBufferGetBytesPerRow(pixelBuffer);
+			for (uint32_t row = 0; row < frameHeight_; ++row)
+			{
+				const uint8_t* srcRow = inputData + (row * frameWidth_ * 4);
+				uint8_t* dstRow = dst + row * dstStride;
+				if (!isRGBA)
+				{
+					memcpy(dstRow, srcRow, frameWidth_ * 4);
+				}
+				else
+				{
+					for (uint32_t col = 0; col < frameWidth_; ++col)
+					{
+						const uint8_t* srcPixel = srcRow + (col * 4);
+						uint8_t* dstPixel = dstRow + (col * 4);
+						dstPixel[0] = srcPixel[2];
+						dstPixel[1] = srcPixel[1];
+						dstPixel[2] = srcPixel[0];
+						dstPixel[3] = srcPixel[3];
+					}
+				}
+			}
+		}
+		else if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+		{
+			uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
+			uint8_t* uvPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+			size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+			size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+
+			for (uint32_t row = 0; row < frameHeight_; ++row)
+			{
+				const uint8_t* srcRow = inputData + (row * frameWidth_ * 4);
+				uint8_t* yRow = yPlane + row * yStride;
+				for (uint32_t col = 0; col < frameWidth_; ++col)
+				{
+					uint8_t r, g, b;
+					LoadRgb(srcRow + (col * 4), isRGBA, r, g, b);
+					yRow[col] = RgbToY(r, g, b);
+				}
+			}
+
+			for (uint32_t row = 0; row < frameHeight_; row += 2)
+			{
+				const uint8_t* row0 = inputData + (row * frameWidth_ * 4);
+				const uint8_t* row1 = inputData + (std::min(row + 1, frameHeight_ - 1) * frameWidth_ * 4);
+				uint8_t* uvRow = uvPlane + (row / 2) * uvStride;
+				for (uint32_t col = 0; col < frameWidth_; col += 2)
+				{
+					const uint32_t col1 = std::min(col + 1, frameWidth_ - 1);
+					uint8_t r00, g00, b00, r01, g01, b01, r10, g10, b10, r11, g11, b11;
+					LoadRgb(row0 + (col * 4), isRGBA, r00, g00, b00);
+					LoadRgb(row0 + (col1 * 4), isRGBA, r01, g01, b01);
+					LoadRgb(row1 + (col * 4), isRGBA, r10, g10, b10);
+					LoadRgb(row1 + (col1 * 4), isRGBA, r11, g11, b11);
+					const uint8_t r = static_cast<uint8_t>((r00 + r01 + r10 + r11 + 2) >> 2);
+					const uint8_t g = static_cast<uint8_t>((g00 + g01 + g10 + g11 + 2) >> 2);
+					const uint8_t b = static_cast<uint8_t>((b00 + b01 + b10 + b11 + 2) >> 2);
+					uvRow[col] = RgbToU(r, g, b);
+					uvRow[col + 1] = RgbToV(r, g, b);
+				}
+			}
+		}
+		else if (fmt == kCVPixelFormatType_420YpCbCr8Planar
+#ifdef kCVPixelFormatType_420YpCbCr8PlanarFullRange
+			|| fmt == kCVPixelFormatType_420YpCbCr8PlanarFullRange
+#endif
+		)
+		{
+			uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
+			uint8_t* uPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+			uint8_t* vPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 2));
+			size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+			size_t uStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+			size_t vStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 2);
+
+			for (uint32_t row = 0; row < frameHeight_; ++row)
+			{
+				const uint8_t* srcRow = inputData + (row * frameWidth_ * 4);
+				uint8_t* yRow = yPlane + row * yStride;
+				for (uint32_t col = 0; col < frameWidth_; ++col)
+				{
+					uint8_t r, g, b;
+					LoadRgb(srcRow + (col * 4), isRGBA, r, g, b);
+					yRow[col] = RgbToY(r, g, b);
+				}
+			}
+
+			for (uint32_t row = 0; row < frameHeight_; row += 2)
+			{
+				const uint8_t* row0 = inputData + (row * frameWidth_ * 4);
+				const uint8_t* row1 = inputData + (std::min(row + 1, frameHeight_ - 1) * frameWidth_ * 4);
+				uint8_t* uRow = uPlane + (row / 2) * uStride;
+				uint8_t* vRow = vPlane + (row / 2) * vStride;
+				for (uint32_t col = 0; col < frameWidth_; col += 2)
+				{
+					const uint32_t col1 = std::min(col + 1, frameWidth_ - 1);
+					uint8_t r00, g00, b00, r01, g01, b01, r10, g10, b10, r11, g11, b11;
+					LoadRgb(row0 + (col * 4), isRGBA, r00, g00, b00);
+					LoadRgb(row0 + (col1 * 4), isRGBA, r01, g01, b01);
+					LoadRgb(row1 + (col * 4), isRGBA, r10, g10, b10);
+					LoadRgb(row1 + (col1 * 4), isRGBA, r11, g11, b11);
+					const uint8_t r = static_cast<uint8_t>((r00 + r01 + r10 + r11 + 2) >> 2);
+					const uint8_t g = static_cast<uint8_t>((g00 + g01 + g10 + g11 + 2) >> 2);
+					const uint8_t b = static_cast<uint8_t>((b00 + b01 + b10 + b11 + 2) >> 2);
+					uRow[col / 2] = RgbToU(r, g, b);
+					vRow[col / 2] = RgbToV(r, g, b);
+				}
+			}
+		}
+		else
+		{
+			ok = false;
+		}
+	}
+	else
+	{
+		ok = false;
+	}
+
+	CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+	if (!ok)
+	{
+		UE_LOG(LogTemp, Error, TEXT("HevcEncoder: Unsupported pixel conversion path input=%s pixelFormat=%s"), *FString(inputFormat.c_str()), *PixelFormatToString(fmt));
+	}
+	return ok;
+}
+
+bool HevcEncoder::EncodeWithVideoToolbox(const uint8_t* inputData, uint32_t inputSize, const std::string& inputFormat)
+{
+	if (!useVideoToolbox_ || !compressionSession_ || !EnsureVideoToolboxPixelBufferPool())
+	{
+		return false;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (pendingEncodeCount_ >= maxPendingFrames_)
+		{
+			++droppedFrames_;
+			return false;
+		}
+		++pendingEncodeCount_;
+		++perfFramesAccumulated_;
+	}
+
+	auto allocStart = std::chrono::high_resolution_clock::now();
+	CVPixelBufferRef pixelBuffer = nullptr;
+	const CVReturn createStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pixelBufferPool_, &pixelBuffer);
+	auto allocEnd = std::chrono::high_resolution_clock::now();
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		++vtAllocSamples_;
+		vtAllocMsTotal_ += std::chrono::duration<double, std::milli>(allocEnd - allocStart).count();
+	}
+
+	if (createStatus != kCVReturnSuccess || !pixelBuffer)
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (pendingEncodeCount_ > 0)
+		{
+			--pendingEncodeCount_;
+		}
+		++droppedFrames_;
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: CVPixelBufferPoolCreatePixelBuffer failed status=%d (%s)"), static_cast<int>(createStatus), DecodeCVStatus(createStatus));
+		return false;
+	}
+
+	auto convertStart = std::chrono::high_resolution_clock::now();
+	const bool converted = ConvertInputToPixelBuffer(inputData, inputSize, inputFormat, pixelBuffer);
+	auto convertEnd = std::chrono::high_resolution_clock::now();
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		++vtConvertSamples_;
+		vtConvertMsTotal_ += std::chrono::duration<double, std::milli>(convertEnd - convertStart).count();
+	}
+
+	if (!converted)
+	{
+		CVPixelBufferRelease(pixelBuffer);
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (pendingEncodeCount_ > 0)
+		{
+			--pendingEncodeCount_;
+		}
+		++droppedFrames_;
+		return false;
+	}
+
+	const bool forceKeyframe = (frameCounter_ == 0);
+	CFDictionaryRef frameProperties = nullptr;
+	if (forceKeyframe)
+	{
+		CFStringRef keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
+		CFBooleanRef values[] = { kCFBooleanTrue };
+		frameProperties = CFDictionaryCreate(
+			kCFAllocatorDefault,
+			reinterpret_cast<const void**>(keys),
+			reinterpret_cast<const void**>(values),
+			1,
+			&kCFTypeDictionaryKeyCallBacks,
+			&kCFTypeDictionaryValueCallBacks);
+	}
+
+	std::unique_ptr<PendingFrameContext> frameContext(new PendingFrameContext());
+	frameContext->Encoder = this;
+	frameContext->FrameIndex = frameCounter_;
+	frameContext->SubmitTime = std::chrono::high_resolution_clock::now();
+	frameContext->ForceKeyframe = forceKeyframe;
+
+	const CMTime presentationTime = CMTimeMake(frameCounter_, expectedFrameRate_);
+	const CMTime duration = CMTimeMake(1, expectedFrameRate_);
+	++frameCounter_;
+
+	VTEncodeInfoFlags encodeInfoFlags = 0;
+	const OSStatus encodeStatus = VTCompressionSessionEncodeFrame(
+		compressionSession_,
+		pixelBuffer,
+		presentationTime,
+		duration,
+		frameProperties,
+		frameContext.get(),
+		&encodeInfoFlags);
+
+	if (frameProperties)
+	{
+		CFRelease(frameProperties);
+	}
+	CVPixelBufferRelease(pixelBuffer);
+
+	if (encodeStatus != noErr)
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (pendingEncodeCount_ > 0)
+		{
+			--pendingEncodeCount_;
+		}
+		++droppedFrames_;
+		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: VTCompressionSessionEncodeFrame failed status=%d"), static_cast<int>(encodeStatus));
+		return false;
+	}
+
+	if ((encodeInfoFlags & kVTEncodeInfo_FrameDropped) != 0)
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (pendingEncodeCount_ > 0)
+		{
+			--pendingEncodeCount_;
+		}
+		++droppedFrames_;
+		return true;
+	}
+
+	frameContext.release();
+	return true;
+}
+
+void HevcEncoder::DrainCompletedVideoToolboxFrames()
+{
+	EncodedFrame completedFrame;
+	bool hasFrame = false;
+	{
+		std::lock_guard<std::mutex> lock(encodeMutex_);
+		if (!completedFrames_.empty())
+		{
+			completedFrame = std::move(completedFrames_.front());
+			completedFrames_.pop_front();
+			hasFrame = true;
+		}
+	}
+
+	if (hasFrame)
+	{
+		PublishOutputFrame(completedFrame.Data);
+	}
+	else
+	{
+		ClearOutputFrame();
+	}
+}
+
+void HevcEncoder::CompressionCallback(
+	void* outputCallbackRefCon,
 	void* sourceFrameRefCon,
 	OSStatus status,
 	VTEncodeInfoFlags infoFlags,
 	CMSampleBufferRef sampleBuffer)
 {
-	HevcEncoder* encoder = static_cast<HevcEncoder*>(outputCallbackRefCon);
-	UE_LOG(LogTemp, Verbose, TEXT("CompressionCallback: status=%d, infoFlags=%u, sampleBuffer=%p"), (int)status, (unsigned)infoFlags, sampleBuffer);
-	if (encoder)
+	VideoToolboxCallbackState* callbackState = static_cast<VideoToolboxCallbackState*>(outputCallbackRefCon);
+	PendingFrameContext* frameContext = static_cast<PendingFrameContext*>(sourceFrameRefCon);
+	if (!callbackState)
 	{
-		encoder->HandleEncodedFrame(status, sampleBuffer);
+		delete frameContext;
+		return;
 	}
+
+	HevcEncoder* encoder = nullptr;
+	{
+		std::lock_guard<std::mutex> callbackLock(callbackState->Mutex);
+		++callbackState->ActiveCallbacks;
+		encoder = callbackState->Encoder;
+	}
+
+	struct FScopedCallbackActivity
+	{
+		VideoToolboxCallbackState* State;
+		~FScopedCallbackActivity()
+		{
+			std::lock_guard<std::mutex> callbackLock(State->Mutex);
+			if (State->ActiveCallbacks > 0)
+			{
+				--State->ActiveCallbacks;
+			}
+			State->Cv.notify_all();
+		}
+	} callbackScope{ callbackState };
+
+	if (!encoder)
+	{
+		delete frameContext;
+		return;
+	}
+
+	if ((infoFlags & kVTEncodeInfo_FrameDropped) != 0)
+	{
+		std::lock_guard<std::mutex> lock(encoder->encodeMutex_);
+		if (encoder->pendingEncodeCount_ > 0)
+		{
+			--encoder->pendingEncodeCount_;
+		}
+		++encoder->droppedFrames_;
+		delete frameContext;
+		return;
+	}
+
+	encoder->HandleEncodedFrame(status, sampleBuffer, frameContext);
 }
 
-void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBuffer)
+void HevcEncoder::HandleEncodedFrame(OSStatus status, CMSampleBufferRef sampleBuffer, PendingFrameContext* frameContext)
 {
-	UE_LOG(LogTemp, Verbose, TEXT("HandleEncodedFrame: status=%d, sampleBuffer=%p"), (int)status, sampleBuffer);
-	std::lock_guard<std::mutex> lock(encodeMutex_);
+	std::unique_ptr<PendingFrameContext> ownedContext(frameContext);
+	std::vector<uint8_t> encodedData;
+	bool isKeyframe = false;
 
 	if (status == noErr && sampleBuffer)
 	{
-		// Get the encoded data from the sample buffer
 		CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-		
-		if (blockBuffer)
+		CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
+		size_t parameterSetCount = 0;
+		int naluHeaderLength = 4;
+		if (formatDescription)
 		{
-			// Determine the NALU length field size from the format description
-			CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-			size_t parameterSetCount = 0;
-			int nalu_header_length = 4; // default to 4 if API fails
-			(void)CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, 0, nullptr, nullptr, &parameterSetCount, &nalu_header_length);
-			if (nalu_header_length != 1 && nalu_header_length != 2 && nalu_header_length != 4) {
-				// guard against unexpected values
-				nalu_header_length = 4;
-			}
-			
-			// Determine if this is a keyframe
-			bool isKeyframe = false;
-			CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
-			if (attachments && CFArrayGetCount(attachments) > 0)
+			CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, 0, nullptr, nullptr, &parameterSetCount, &naluHeaderLength);
+			if (naluHeaderLength != 1 && naluHeaderLength != 2 && naluHeaderLength != 4)
 			{
-				CFDictionaryRef attachment = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-				CFBooleanRef dependsOnOthers = (CFBooleanRef)CFDictionaryGetValue(attachment, kCMSampleAttachmentKey_DependsOnOthers);
-				isKeyframe = (dependsOnOthers == kCFBooleanFalse);
+				naluHeaderLength = 4;
 			}
-			
-			// APPROACH 3 WORKAROUND: Always inject parameter sets on every frame
-			// This is more aggressive than standard practice but works around GStreamer rtph265depay
-			// issues with out-of-band parameter sets. Trade-off: ~71 bytes overhead per frame.
-			if (true) // Was: if (isKeyframe)
+		}
+
+		CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+		if (attachments && CFArrayGetCount(attachments) > 0)
+		{
+			CFDictionaryRef attachment = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, 0));
+			CFBooleanRef dependsOnOthers = static_cast<CFBooleanRef>(CFDictionaryGetValue(attachment, kCMSampleAttachmentKey_DependsOnOthers));
+			isKeyframe = (dependsOnOthers == kCFBooleanFalse);
+		}
+
+		if (formatDescription)
+		{
+			for (size_t i = 0; i < parameterSetCount; ++i)
 			{
-				for (size_t i = 0; i < parameterSetCount; i++)
+				const uint8_t* parameterSet = nullptr;
+				size_t parameterSetSize = 0;
+				if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDescription, i, &parameterSet, &parameterSetSize, nullptr, nullptr) == noErr && parameterSet && parameterSetSize > 0)
 				{
-					const uint8_t* parameterSet = nullptr;
-					size_t parameterSetSize = 0;
-					if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, i, &parameterSet, &parameterSetSize, nullptr, nullptr) == noErr)
-					{
-						uint8_t nalType = HevcNalType(parameterSet, parameterSetSize);
-						//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Injecting parameter set NAL type=%d (%s), size=%d"),
-						//	nalType, *NalTypeName(nalType), (int)parameterSetSize);
-						encodedData_.insert(encodedData_.end(), {0x00,0x00,0x00,0x01});
-						encodedData_.insert(encodedData_.end(), parameterSet, parameterSet + parameterSetSize);
-					}
+					encodedData.insert(encodedData.end(), { 0x00, 0x00, 0x00, 0x01 });
+					encodedData.insert(encodedData.end(), parameterSet, parameterSet + parameterSetSize);
 				}
 			}
-			
-			// Convert AVCC-like length-prefixed stream to Annex-B format
-			char* dataPtr = nullptr;
+		}
+
+		if (blockBuffer)
+		{
+			char* dataPointer = nullptr;
 			size_t dataSize = 0;
-			CMBlockBufferGetDataPointer(blockBuffer, 0, nullptr, &dataSize, &dataPtr);
-			
-			if (dataPtr && dataSize > 0)
+			if (CMBlockBufferGetDataPointer(blockBuffer, 0, nullptr, &dataSize, &dataPointer) == noErr && dataPointer && dataSize > 0)
 			{
 				size_t offset = 0;
-				while (offset + nalu_header_length <= dataSize)
+				while (offset + naluHeaderLength <= dataSize)
 				{
 					uint32_t naluLength = 0;
-					if (nalu_header_length == 4)
+					if (naluHeaderLength == 4)
 					{
-						naluLength = (static_cast<uint8_t>(dataPtr[offset]) << 24) |
-									 (static_cast<uint8_t>(dataPtr[offset + 1]) << 16) |
-									 (static_cast<uint8_t>(dataPtr[offset + 2]) << 8) |
-									 static_cast<uint8_t>(dataPtr[offset + 3]);
+						naluLength = (static_cast<uint8_t>(dataPointer[offset]) << 24) |
+							(static_cast<uint8_t>(dataPointer[offset + 1]) << 16) |
+							(static_cast<uint8_t>(dataPointer[offset + 2]) << 8) |
+							static_cast<uint8_t>(dataPointer[offset + 3]);
 					}
-					else if (nalu_header_length == 2)
+					else if (naluHeaderLength == 2)
 					{
-						naluLength = (static_cast<uint8_t>(dataPtr[offset]) << 8) |
-									 static_cast<uint8_t>(dataPtr[offset + 1]);
+						naluLength = (static_cast<uint8_t>(dataPointer[offset]) << 8) |
+							static_cast<uint8_t>(dataPointer[offset + 1]);
 					}
-					else // nalu_header_length == 1
+					else
 					{
-						naluLength = static_cast<uint8_t>(dataPtr[offset]);
+						naluLength = static_cast<uint8_t>(dataPointer[offset]);
 					}
-					offset += nalu_header_length;
+
+					offset += naluHeaderLength;
 					if (naluLength == 0 || offset + naluLength > dataSize)
 					{
 						break;
 					}
-					// Annex-B start code + NALU bytes
-					encodedData_.insert(encodedData_.end(), {0x00,0x00,0x00,0x01});
-					encodedData_.insert(encodedData_.end(), reinterpret_cast<uint8_t*>(dataPtr + offset), reinterpret_cast<uint8_t*>(dataPtr + offset + naluLength));
+
+					encodedData.insert(encodedData.end(), { 0x00, 0x00, 0x00, 0x01 });
+					encodedData.insert(
+						encodedData.end(),
+						reinterpret_cast<uint8_t*>(dataPointer + offset),
+						reinterpret_cast<uint8_t*>(dataPointer + offset + naluLength));
 					offset += naluLength;
 				}
 			}
 		}
-		
-		// Log the final Annex-B output with detailed NAL analysis
-		if (!encodedData_.empty())
-		{
-			// Log first 8 bytes in hex for comparison with RTP transmitter
-			if (encodedData_.size() >= 8)
-			{
-				//UE_LOG(LogTemp, Log, TEXT("HevcEncoder: Output %d bytes, head=%02X %02X %02X %02X %02X %02X %02X %02X"),
-				//	(int)encodedData_.size(),
-				//	encodedData_[0], encodedData_[1], encodedData_[2], encodedData_[3],
-				//	encodedData_[4], encodedData_[5], encodedData_[6], encodedData_[7]);
-			}
-			// Parse and log the Annex-B access unit
-			LogAnnexBAU(encodedData_.data(), encodedData_.size());
-			
-			// TEMPORARY: Dump to file for validation (comment out after testing)
-			#ifdef CITHRUS_HEVC_FILE_DUMP
-			static FILE* dumpFile = nullptr;
-			if (!dumpFile)
-			{
-				dumpFile = fopen("/tmp/hevc_encoder_output.265", "wb");
-				if (dumpFile)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Dumping output to /tmp/hevc_encoder_output.265"));
-				}
-			}
-			if (dumpFile)
-			{
-				fwrite(encodedData_.data(), 1, encodedData_.size(), dumpFile);
-				fflush(dumpFile);
-			}
-			#endif
-		}
 	}
-	else if (status != noErr)
+
+	const double encodeMilliseconds = ownedContext
+		? std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - ownedContext->SubmitTime).count()
+		: 0.0;
+
+	std::lock_guard<std::mutex> lock(encodeMutex_);
+	if (pendingEncodeCount_ > 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Compression callback status=%d"), (int)status);
+		--pendingEncodeCount_;
+	}
+
+	if (status == noErr && !encodedData.empty())
+	{
+		++vtEncodeSamples_;
+		vtEncodeMsTotal_ += encodeMilliseconds;
+		if (completedFrames_.size() >= maxPendingFrames_)
+		{
+			completedFrames_.pop_front();
+			++droppedFrames_;
+			++droppedCompletedFrames_;
+		}
+
+		completedFrames_.push_back({ std::move(encodedData), encodeMilliseconds, isKeyframe });
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("HevcEncoder: Compression callback returned empty sample"));
+		++droppedFrames_;
 	}
-	
-	encodeComplete_ = true;
-	encodeCv_.notify_one();
-}
-
-bool HevcEncoder::ConvertYUVToPixelBuffer(const uint8_t* yuvData, CVPixelBufferRef pixelBuffer)
-{
-	OSStatus status = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-	
-	if (status != kCVReturnSuccess)
-	{
-		return false;
-	}
-	
-	// Detect pixel format
-	OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
-	// Input yuvData is I420: Y plane W*H, then U plane (W/2 * H/2), then V plane (W/2 * H/2)
-	const uint8_t* srcY = yuvData;
-	const uint8_t* srcU = srcY + (frameWidth_ * frameHeight_);
-	const uint8_t* srcV = srcU + (frameWidth_ * frameHeight_ / 4);
-
-	bool ok = true;
-	if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-	{
-		// NV12: plane 0 is Y, plane 1 is interleaved UV
-		uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
-		uint8_t* uvPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
-		size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-		size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-
-		// Copy Y
-		for (uint32_t row = 0; row < frameHeight_; ++row)
-		{
-			memcpy(yPlane + row * yStride, srcY + row * frameWidth_, frameWidth_);
-		}
-		// Interleave U and V into UV plane
-		for (uint32_t row = 0; row < frameHeight_ / 2; ++row)
-		{
-			uint8_t* dst = uvPlane + row * uvStride;
-			const uint8_t* uRow = srcU + row * (frameWidth_ / 2);
-			const uint8_t* vRow = srcV + row * (frameWidth_ / 2);
-			for (uint32_t col = 0; col < frameWidth_ / 2; ++col)
-			{
-				// NV12 expects UV ordering (Cb then Cr)
-				dst[2 * col + 0] = uRow[col];
-				dst[2 * col + 1] = vRow[col];
-			}
-		}
-	}
-	else if (fmt == kCVPixelFormatType_420YpCbCr8Planar)
-	{
-		// I420 planar (3 planes)
-		uint8_t* yPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
-		uint8_t* uPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
-		uint8_t* vPlane = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 2));
-		size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-		size_t uStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-		size_t vStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 2);
-
-		for (uint32_t row = 0; row < frameHeight_; ++row)
-		{
-			memcpy(yPlane + (row * yStride), srcY + (row * frameWidth_), frameWidth_);
-		}
-		for (uint32_t row = 0; row < frameHeight_ / 2; ++row)
-		{
-			memcpy(uPlane + (row * uStride), srcU + (row * frameWidth_ / 2), frameWidth_ / 2);
-		}
-		for (uint32_t row = 0; row < frameHeight_ / 2; ++row)
-		{
-			memcpy(vPlane + (row * vStride), srcV + (row * frameWidth_ / 2), frameWidth_ / 2);
-		}
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("HevcEncoder: Unsupported pixel buffer format: 0x%x"), (unsigned)fmt);
-		ok = false;
-	}
-	
-	CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-	
-	return ok;
 }
 #endif // CITHRUS_VIDEOTOOLBOX_AVAILABLE
 
 #ifdef CITHRUS_VIDEOTOOLBOX_AVAILABLE
-static const TCHAR* DecodeCVStatus(OSStatus s)
+static const TCHAR* DecodeCVStatus(OSStatus status)
 {
-	switch (s)
+	switch (status)
 	{
 	case kCVReturnSuccess: return TEXT("kCVReturnSuccess");
 	case kCVReturnInvalidArgument: return TEXT("kCVReturnInvalidArgument");
@@ -950,8 +1518,8 @@ static const TCHAR* DecodeCVStatus(OSStatus s)
 	case kCVReturnInvalidSize: return TEXT("kCVReturnInvalidSize");
 	case kCVReturnInvalidPixelBufferAttributes: return TEXT("kCVReturnInvalidPixelBufferAttributes");
 	case kCVReturnPixelBufferNotOpenGLCompatible: return TEXT("kCVReturnPixelBufferNotOpenGLCompatible");
-	case kCVReturnWouldExceedAllocationThreshold: return TEXT("kCVReturnWouldExceedAllocationThreshold (-6662)");
-	case kCVReturnPoolAllocationFailed: return TEXT("kCVReturnPoolAllocationFailed (-6661)");
+	case kCVReturnWouldExceedAllocationThreshold: return TEXT("kCVReturnWouldExceedAllocationThreshold");
+	case kCVReturnPoolAllocationFailed: return TEXT("kCVReturnPoolAllocationFailed");
 	default: return TEXT("Unknown CV status");
 	}
 }

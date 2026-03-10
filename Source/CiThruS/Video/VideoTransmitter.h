@@ -14,6 +14,7 @@
 #include <thread>
 #include <mutex>
 
+#include "HevcEncoderBackend.h"
 #include "VideoTransmitter.generated.h"
 
 class USceneCaptureComponent2D;
@@ -56,6 +57,21 @@ public:
 	int processingThreadCount_ = 8;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	EHevcEncoderBackend hevcEncoderBackend_ = EHevcEncoderBackend::Auto;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	int maxStreamFps_ = 30;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	bool dropFramesWhenBusy_ = true;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	float targetBitrateMbps_ = 1.5f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	int maxKeyFrameInterval_ = 60;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	bool saveToFile_ = false;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
@@ -94,6 +110,7 @@ private:
 	bool capture360_;
 
 	bool useEditorTick_;
+	double captureAccumulator_ = 0.0;
 
 	virtual void PostRegisterAllComponents() override;
 	virtual void EndPlay(const EEndPlayReason::Type endPlayReason) override;

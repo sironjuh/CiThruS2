@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Video/HevcEncoderBackend.h"
 
 #include <iostream>
 #include <memory>
@@ -76,6 +77,21 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	EHevcDecoderBackend hevcDecoderBackend_ = EHevcDecoderBackend::Auto;
 
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	EHevcEncoderBackend hevcEncoderBackend_ = EHevcEncoderBackend::Auto;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	float targetBitrateMbps_ = 1.5f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	int maxKeyFrameInterval_ = 60;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	int maxStreamFps_ = 30;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	bool dropFramesWhenBusy_ = true;
+
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Kvazaar Settings")
 	int overlappedWavefront_ = 3;
 
@@ -124,6 +140,7 @@ protected:
 
 	uint32_t frameNumber_;
 	uint64_t startTimestampMs_;
+	double captureAccumulator_ = 0.0;
 
 	bool wantsStop_ = false;
 	bool mainMenuWidgetClassLookupAttempted_ = false;

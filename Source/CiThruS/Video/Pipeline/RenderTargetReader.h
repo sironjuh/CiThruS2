@@ -5,6 +5,9 @@
 
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+
+class UTextureRenderTarget2D;
 
 // Reads data from RHI render targets in VRAM
 class CITHRUS_API RenderTargetReader : public PipelineSource<2>
@@ -16,6 +19,8 @@ public:
 	virtual void Process() override;
 
 	void Read(uint8_t* userData = nullptr, const uint32_t& userDataSize = 0);
+	bool TryRead(uint8_t* userData = nullptr, const uint32_t& userDataSize = 0);
+	bool IsBusy();
 
 protected:
 	std::vector<FRHITexture*> textures_;
@@ -43,6 +48,7 @@ protected:
 	bool frameDirty_;
 
 	bool flushNeeded_;
+	bool extractQueued_;
 	std::condition_variable flushCv_;
 	std::mutex flushMutex_;
 
@@ -51,6 +57,9 @@ protected:
 
 	// Used to prevent resources from being deleted while they might still be in use on another thread
 	std::mutex resourceMutex_;
+	std::mutex renderCommandMutex_;
+	std::condition_variable renderCommandCv_;
+	uint32_t pendingRenderCommandCount_ = 0;
 
 	uint8_t bufferIndex_;
 
@@ -59,6 +68,9 @@ protected:
 	bool initialized_;
 	bool destroyed_;
 
+	bool QueueRead(uint8_t* userData, const uint32_t& userDataSize, bool waitIfBusy);
+	void BeginRenderCommand();
+	void EndRenderCommand();
 	void Flush();
 	void ConvertDepth(FRHICommandListImmediate& RHICmdList) const;
 	void ExtractStagingBuffer(FRHICommandListImmediate& RHICmdList);

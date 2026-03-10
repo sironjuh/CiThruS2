@@ -1,7 +1,9 @@
 #include "RtpTransmitter.h"
 #include "PipelineSource.h"
 #include "Misc/Debug.h"
+#include "StreamPerfStats.h"
 #include <vector>
+#include <chrono>
 
 RtpTransmitter::RtpTransmitter(const std::string& ip, const int& dstPort)
 {
@@ -74,6 +76,7 @@ void RtpTransmitter::Process()
 	}
 
 #ifdef CITHRUS_UVGRTP_AVAILABLE
+	auto sendStart = std::chrono::high_resolution_clock::now();
 	// Parse Annex-B stream and send each NAL unit individually
 	// This is CRITICAL for proper H.265 RTP packetization
 	std::vector<std::pair<const uint8_t*, size_t>> nalUnits;
@@ -157,10 +160,13 @@ void RtpTransmitter::Process()
 		RTP_ERROR err = stream_->push_frame(const_cast<uint8_t*>(nal.first), nal.second, RTP_NO_H26X_SCL);
 		if (err != RTP_ERROR::RTP_OK)
 		{
+			StreamPerfStats::AddRtpDrop();
 			UE_LOG(LogTemp, Error, TEXT("RtpTransmitter: push_frame failed err=%d, nalType=%d, nalSize=%d"), (int)err, nalType, (int)nal.second);
 			break;
 		}
 		nalIndex++;
 	}
+	auto sendEnd = std::chrono::high_resolution_clock::now();
+	StreamPerfStats::AddRtpSendSample(std::chrono::duration<double, std::milli>(sendEnd - sendStart).count());
 #endif // CITHRUS_UVGRTP_AVAILABLE
 }

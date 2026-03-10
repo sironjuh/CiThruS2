@@ -3,6 +3,7 @@
 #include "Misc/Debug.h"
 
 #include <stdexcept>
+#include <chrono>
 
 AsyncPipelineRunner::AsyncPipelineRunner(Pipeline* pipeline)
 	: wantsStop_(false),
@@ -24,7 +25,14 @@ void AsyncPipelineRunner::RunPipeline(Pipeline* pipeline)
 	{
 		while (!wantsStop_)
 		{
+			auto loopStart = std::chrono::steady_clock::now();
 			pipeline->Run();
+			auto loopEnd = std::chrono::steady_clock::now();
+			auto loopDuration = loopEnd - loopStart;
+			if (loopDuration < std::chrono::milliseconds(1))
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(1) - loopDuration);
+			}
 		}
 	}
 	catch (const std::exception& exception)

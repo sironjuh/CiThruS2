@@ -210,6 +210,7 @@ void RgbaToYuvConverter::Process()
 #if defined(CITHRUS_NEON_AVAILABLE)
     static bool sLogged = false; if (!sLogged) { UE_LOG(LogTemp, Display, TEXT("RgbaToYuvConverter: Using NEON optimized path (ARM).")); sLogged = true; }
     RgbaToYuvNeon_impl(inputData, outputData_, outputFrameWidth_, outputFrameHeight_, isRGBA);
+#ifdef CITHRUS_VALIDATE_NEON_RGBA_TO_YUV
     static bool sVerified = false; if (!sVerified) {
         const size_t refSize = outputFrameWidth_ * outputFrameHeight_ * 3 / 2;
         TArray<uint8> RefBuf; RefBuf.AddUninitialized(refSize);
@@ -219,6 +220,7 @@ void RgbaToYuvConverter::Process()
         if (mismatches == 0) { UE_LOG(LogTemp, Display, TEXT("RgbaToYuvConverter: NEON output validated against scalar reference.")); } else { UE_LOG(LogTemp, Warning, TEXT("RgbaToYuvConverter: NEON path had %d mismatches vs scalar reference."), mismatches); }
         sVerified = true;
     }
+#endif
 #elif defined(CITHRUS_SSE41_AVAILABLE)
     RgbaToYuvSse41(inputData, &outputData_, outputFrameWidth_, outputFrameHeight_);
 #else

@@ -132,6 +132,17 @@ void AViewSynthesizer::Tick(float deltaTime)
         return;
     }
 
+    if (!saveToFile_ && maxStreamFps_ > 0)
+    {
+        const double frameInterval = 1.0 / static_cast<double>(maxStreamFps_);
+        captureAccumulator_ += static_cast<double>(deltaTime);
+        if (captureAccumulator_ < frameInterval)
+        {
+            return;
+        }
+        captureAccumulator_ = std::min(captureAccumulator_ - frameInterval, frameInterval);
+    }
+
     Capture();
 }
 
@@ -141,6 +152,7 @@ void AViewSynthesizer::StartTransmit()
 
     if (ResetStreams())
     {
+        captureAccumulator_ = 0.0;
         transmitEnabled_ = true;
         useEditorTick_ = true;
     }
@@ -178,9 +190,12 @@ bool AViewSynthesizer::StartStreams()
     frameWidth += (8 - (frameWidth % 8)) % 8;
     frameHeight += (8 - (frameHeight % 8)) % 8;
 
+    const uint32_t expectedStreamFps = static_cast<uint32_t>(std::max(maxStreamFps_, 1));
+
     wantsStop_ = false;
     frameNumber_ = 0;
     startTimestampMs_ = 0;
+    captureAccumulator_ = 0.0;
 
     frontCamera_->FOVAngle = frontFov_;
     rearCamera_->FOVAngle = rearFov_;
@@ -239,7 +254,7 @@ bool AViewSynthesizer::StartStreams()
                                                 }),
                                                 new ImageConcatenator<2>(frameWidth, frameHeight))
                                         ),
-                                        new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency)
+                                        new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency, hevcEncoderBackend_, targetBitrateMbps_, static_cast<uint32_t>(maxKeyFrameInterval_), expectedStreamFps)
                                     }),
                                     new ImageSequentialFilter()
                                 }),
@@ -259,7 +274,7 @@ bool AViewSynthesizer::StartStreams()
                                             new ScaffoldingSidechainSource<1, 1>(
                                                 new SolidColorImageGenerator(frameWidth, frameHeight, 0, 128, 128),
                                                 new ImageConcatenator<2>(frameWidth, frameHeight)),
-                                            new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency),
+                                            new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency, hevcEncoderBackend_, targetBitrateMbps_, static_cast<uint32_t>(maxKeyFrameInterval_), expectedStreamFps),
                                         }),
                                     new ImageSequentialFilter()
                                 }),
@@ -305,6 +320,7 @@ void AViewSynthesizer::DeleteStreams()
     }
 
     runners_.clear();
+    captureAccumulator_ = 0.0;
 
     // These are already deleted by the pipeline so don't delete them twice
     frontReader_ = nullptr;
@@ -327,10 +343,21 @@ void AViewSynthesizer::StopTransmitInternal()
     transmitEnabled_ = false;
     useEditorTick_ = false;
     wantsStop_ = false;
+    captureAccumulator_ = 0.0;
 }
 
 void AViewSynthesizer::Capture()
 {
+    if (dropFramesWhenBusy_)
+    {
+        const bool frontBusy = frontReader_ && frontReader_->IsBusy();
+        const bool rearBusy = rearReader_ && rearReader_->IsBusy();
+        if (frontBusy || rearBusy)
+        {
+            return;
+        }
+    }
+
     if (frontReader_)
     {
         frontCamera_->CaptureScene();
@@ -367,7 +394,13 @@ void AViewSynthesizer::Capture()
 
         frontCameraParams.timestamp = timestampMs - startTimestampMs_;
 
-        frontReader_->Read(reinterpret_cast<uint8_t*>(&frontCameraParams), sizeof(ViewSynthCameraParams));
+        const bool frontQueued = dropFramesWhenBusy_
+            ? frontReader_->TryRead(reinterpret_cast<uint8_t*>(&frontCameraParams), sizeof(ViewSynthCameraParams))
+            : (frontReader_->Read(reinterpret_cast<uint8_t*>(&frontCameraParams), sizeof(ViewSynthCameraParams)), true);
+        if (!frontQueued)
+        {
+            return;
+        }
     }
 
     if (rearReader_)
@@ -389,7 +422,13 @@ void AViewSynthesizer::Capture()
 
         rearCameraParams.timestamp = timestampMs - startTimestampMs_;
 
-        rearReader_->Read(reinterpret_cast<uint8_t*>(&rearCameraParams), sizeof(ViewSynthCameraParams));
+        const bool rearQueued = dropFramesWhenBusy_
+            ? rearReader_->TryRead(reinterpret_cast<uint8_t*>(&rearCameraParams), sizeof(ViewSynthCameraParams))
+            : (rearReader_->Read(reinterpret_cast<uint8_t*>(&rearCameraParams), sizeof(ViewSynthCameraParams)), true);
+        if (!rearQueued)
+        {
+            return;
+        }
     }
 
     frameNumber_++;
