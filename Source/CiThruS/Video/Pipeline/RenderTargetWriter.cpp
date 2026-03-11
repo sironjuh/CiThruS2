@@ -8,7 +8,18 @@
 #include <cstring>
 
 RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
-	: inputBuffer_(nullptr), texture_(nullptr), frameWidth_(0), frameHeight_(0), bytesPerPixel_(0), frameDirty_(false), initialized_(false), destroyed_(false)
+	: frameBuffers_{ nullptr, nullptr }
+	, texture_(nullptr)
+	, frameWidth_(0)
+	, frameHeight_(0)
+	, bytesPerPixel_(0)
+	, pendingFrameAvailable_(false)
+	, pendingBufferIndex_(0)
+	, uploadBufferIndex_(-1)
+	, renderCommandQueued_(false)
+	, pendingFrameReadyTime_(std::chrono::steady_clock::time_point::min())
+	, initialized_(false)
+	, destroyed_(false)
 {
 	if (!texture)
 	{
@@ -38,16 +49,14 @@ RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
 		return;
 	}
 
-	// Note that this is executed on the render thread later and not yet
 	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(InitializeReader)(
 		[this, texture](FRHICommandListImmediate& RHICmdList)
 		{
-			resourceMutex_.lock();
+			std::lock_guard<std::mutex> resourceLock(resourceMutex_);
 
 			if (destroyed_)
 			{
-				resourceMutex_.unlock();
 				EndRenderCommand();
 				return;
 			}
@@ -55,10 +64,12 @@ RenderTargetWriter::RenderTargetWriter(UTextureRenderTarget2D* texture)
 			texture_ = texture->GetResource()->GetTexture2DRHI();
 			frameWidth_ = texture_->GetDesc().Extent.X;
 			frameHeight_ = texture_->GetDesc().Extent.Y;
-			inputBuffer_ = new uint8_t[frameWidth_ * frameHeight_ * bytesPerPixel_];
+
+			const size_t bufferSize = static_cast<size_t>(frameWidth_) * static_cast<size_t>(frameHeight_) * static_cast<size_t>(bytesPerPixel_);
+			frameBuffers_[0] = new uint8_t[bufferSize];
+			frameBuffers_[1] = new uint8_t[bufferSize];
 			initialized_ = true;
 
-			resourceMutex_.unlock();
 			EndRenderCommand();
 		});
 }
@@ -78,8 +89,10 @@ RenderTargetWriter::~RenderTargetWriter()
 
 	std::lock_guard<std::mutex> resourceLock(resourceMutex_);
 
-	delete[] inputBuffer_;
-	inputBuffer_ = nullptr;
+	delete[] frameBuffers_[0];
+	delete[] frameBuffers_[1];
+	frameBuffers_[0] = nullptr;
+	frameBuffers_[1] = nullptr;
 
 	texture_ = nullptr;
 }
@@ -87,53 +100,79 @@ RenderTargetWriter::~RenderTargetWriter()
 void RenderTargetWriter::Process()
 {
 	const uint8_t* inputData = GetInputPin<0>().GetData();
-	uint32_t inputSize = GetInputPin<0>().GetSize();
+	const uint32_t inputSize = GetInputPin<0>().GetSize();
 
 	if (!initialized_ || !inputData || inputSize != frameWidth_ * frameHeight_ * bytesPerPixel_)
 	{
 		return;
 	}
 
-	writeMutex_.lock();
+	double copyMs = 0.0;
+	bool droppedPendingFrame = false;
+	bool shouldQueueRenderCommand = false;
 
-	// We should only pass new data to the render thread if the render thread has processed the previous data!
-	// Otherwise the render commands may pile up faster than UE can execute them and the program hangs
-	if (frameDirty_)
 	{
-		writeMutex_.unlock();
-		RecordDroppedFrame();
-		return;
+		std::lock_guard<std::mutex> writeLock(writeMutex_);
+
+		uint8_t targetBufferIndex = pendingFrameAvailable_ ? pendingBufferIndex_ : 0;
+		if (uploadBufferIndex_ >= 0 && targetBufferIndex == static_cast<uint8_t>(uploadBufferIndex_))
+		{
+			targetBufferIndex = static_cast<uint8_t>(1 - uploadBufferIndex_);
+		}
+
+		droppedPendingFrame = pendingFrameAvailable_ && targetBufferIndex == pendingBufferIndex_;
+
+		const auto copyStart = std::chrono::steady_clock::now();
+		std::memcpy(frameBuffers_[targetBufferIndex], inputData, inputSize);
+		const auto copyEnd = std::chrono::steady_clock::now();
+		copyMs = std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
+
+		pendingBufferIndex_ = targetBufferIndex;
+		pendingFrameAvailable_ = true;
+		pendingFrameReadyTime_ = copyEnd;
+
+		if (!renderCommandQueued_)
+		{
+			renderCommandQueued_ = true;
+			shouldQueueRenderCommand = true;
+		}
 	}
 
-	// Input data must be grabbed now, there's no guarantee inputFrame_ will be valid after exiting this function
-	const auto copyStart = std::chrono::steady_clock::now();
-	std::memcpy(inputBuffer_, inputData, inputSize);
-	const auto copyEnd = std::chrono::steady_clock::now();
-	RecordCopySample(std::chrono::duration<double, std::milli>(copyEnd - copyStart).count());
+	RecordCopySample(copyMs);
+	if (droppedPendingFrame)
+	{
+		RecordDroppedFrame();
+	}
 
-	frameDirty_ = true;
+	if (shouldQueueRenderCommand)
+	{
+		QueueUploadRenderCommand();
+	}
+}
 
-	writeMutex_.unlock();
-
-	const auto enqueueTime = std::chrono::steady_clock::now();
-
-	// Note that this is executed on the render thread later and not yet
+void RenderTargetWriter::QueueUploadRenderCommand()
+{
 	BeginRenderCommand();
 	ENQUEUE_RENDER_COMMAND(ExtractRenderTargets)(
-		[this, enqueueTime](FRHICommandListImmediate& RHICmdList)
+		[this](FRHICommandListImmediate& RHICmdList)
 		{
-			resourceMutex_.lock();
+			std::unique_lock<std::mutex> resourceLock(resourceMutex_);
 
-			if (!initialized_)
+			if (!initialized_ || destroyed_)
 			{
-				resourceMutex_.unlock();
+				{
+					std::lock_guard<std::mutex> writeLock(writeMutex_);
+					renderCommandQueued_ = false;
+					pendingFrameAvailable_ = false;
+					uploadBufferIndex_ = -1;
+				}
+
+				resourceLock.unlock();
 				EndRenderCommand();
 				return;
 			}
 
-			// Write the contents of the texture
 			FUpdateTextureRegion2D updateRegion = {};
-
 			updateRegion.SrcX = 0;
 			updateRegion.SrcY = 0;
 			updateRegion.DestX = 0;
@@ -141,23 +180,60 @@ void RenderTargetWriter::Process()
 			updateRegion.Width = frameWidth_;
 			updateRegion.Height = frameHeight_;
 
-			writeMutex_.lock();
+			const uint8_t* uploadBuffer = nullptr;
+			double queueWaitMs = 0.0;
+			double updateMs = 0.0;
+			double endToEndMs = 0.0;
+			bool shouldQueueAnother = false;
+			std::chrono::steady_clock::time_point frameReadyTime = std::chrono::steady_clock::time_point::min();
+
+			{
+				std::lock_guard<std::mutex> writeLock(writeMutex_);
+
+				if (!pendingFrameAvailable_)
+				{
+					renderCommandQueued_ = false;
+					resourceLock.unlock();
+					EndRenderCommand();
+					return;
+				}
+
+				uploadBufferIndex_ = static_cast<int8_t>(pendingBufferIndex_);
+				pendingFrameAvailable_ = false;
+				frameReadyTime = pendingFrameReadyTime_;
+				uploadBuffer = frameBuffers_[uploadBufferIndex_];
+			}
 
 			const auto renderStart = std::chrono::steady_clock::now();
-			const double queueWaitMs = std::chrono::duration<double, std::milli>(renderStart - enqueueTime).count();
+			queueWaitMs = std::chrono::duration<double, std::milli>(renderStart - frameReadyTime).count();
+
 			const auto updateStart = renderStart;
-			RHICmdList.UpdateTexture2D(texture_, 0, updateRegion, frameWidth_ * bytesPerPixel_, inputBuffer_);
+			RHICmdList.UpdateTexture2D(texture_, 0, updateRegion, frameWidth_ * bytesPerPixel_, uploadBuffer);
 			const auto updateEnd = std::chrono::steady_clock::now();
-			const double updateMs = std::chrono::duration<double, std::milli>(updateEnd - updateStart).count();
-			const double endToEndMs = std::chrono::duration<double, std::milli>(updateEnd - enqueueTime).count();
+			updateMs = std::chrono::duration<double, std::milli>(updateEnd - updateStart).count();
+			endToEndMs = std::chrono::duration<double, std::milli>(updateEnd - frameReadyTime).count();
 
-			frameDirty_ = false;
+			{
+				std::lock_guard<std::mutex> writeLock(writeMutex_);
+				uploadBufferIndex_ = -1;
+				if (pendingFrameAvailable_)
+				{
+					shouldQueueAnother = true;
+				}
+				else
+				{
+					renderCommandQueued_ = false;
+				}
+			}
 
-			writeMutex_.unlock();
-
-			resourceMutex_.unlock();
+			resourceLock.unlock();
 			EndRenderCommand();
 			RecordRenderSamples(queueWaitMs, updateMs, endToEndMs);
+
+			if (shouldQueueAnother)
+			{
+				QueueUploadRenderCommand();
+			}
 		});
 }
 

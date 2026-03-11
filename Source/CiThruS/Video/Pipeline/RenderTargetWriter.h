@@ -3,10 +3,10 @@
 #include "RHIResources.h"
 #include "PipelineSink.h"
 
-#include <vector>
-#include <mutex>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <mutex>
 
 class UTexture2D;
 class UTextureRenderTarget2D;
@@ -21,7 +21,7 @@ public:
 	virtual void Process() override;
 
 protected:
-	uint8_t* inputBuffer_;
+	uint8_t* frameBuffers_[2];
 
 	FRHITexture* texture_;
 
@@ -29,10 +29,14 @@ protected:
 	uint16_t frameHeight_;
 	uint8_t bytesPerPixel_;
 
-	// Whether a new frame should be passed onward or not
-	bool frameDirty_;
+	// Latest frame waiting to be uploaded by the render thread
+	bool pendingFrameAvailable_;
+	uint8_t pendingBufferIndex_;
+	int8_t uploadBufferIndex_;
+	bool renderCommandQueued_;
+	std::chrono::steady_clock::time_point pendingFrameReadyTime_;
 
-	// Used to prevent texture data from being read and written at the same time
+	// Used to prevent the worker thread and render thread from touching the same CPU buffer at once
 	std::mutex writeMutex_;
 
 	// Used to prevent resources from being deleted while they might still be in use on another thread
@@ -59,6 +63,7 @@ protected:
 	bool initialized_;
 	bool destroyed_;
 
+	void QueueUploadRenderCommand();
 	void BeginRenderCommand();
 	void EndRenderCommand();
 	void RecordCopySample(double milliseconds);
