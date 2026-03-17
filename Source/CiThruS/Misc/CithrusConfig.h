@@ -15,7 +15,22 @@ public:
 	UFUNCTION(BlueprintCallable)
 	static bool GetShowIntroduction();
 
+	static bool LoadViewSynthPreviewLayout(float& outXPercent, float& outYPercent, float& outSizePercent);
+	static void SaveViewSynthPreviewLayout(float xPercent, float yPercent, float sizePercent);
+
 private:
 	UPROPERTY(Config)
 	bool ShowIntroduction = true;
+
+	UPROPERTY(Config)
+	bool HasSavedViewSynthPreviewLayout = false;
+
+	UPROPERTY(Config)
+	float ViewSynthPreviewXPercent = 0.0f;
+
+	UPROPERTY(Config)
+	float ViewSynthPreviewYPercent = 0.0f;
+
+	UPROPERTY(Config)
+	float ViewSynthPreviewSizePercent = 0.0f;
 };

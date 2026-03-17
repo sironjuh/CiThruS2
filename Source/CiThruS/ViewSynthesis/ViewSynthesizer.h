@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Video/HevcEncoderBackend.h"
+#include "Widgets/SOverlay.h"
 
 #include <iostream>
 #include <memory>
@@ -15,12 +16,12 @@
 
 class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
+class USpinBox;
 class UUserWidget;
 class RenderTargetReader;
 class RenderTargetWriter;
 class AsyncPipelineRunner;
 class SBox;
-class SOverlay;
 struct FSlateBrush;
 
 UENUM(BlueprintType)
@@ -49,6 +50,30 @@ public:
 
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Stream Controls")
 	void StopTransmit();
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	void SetPreviewXPercent(float value);
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	void SetPreviewYPercent(float value);
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	void SetPreviewSizePercent(float value);
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	float GetPreviewXPercent() const;
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	float GetPreviewYPercent() const;
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	float GetPreviewSizePercent() const;
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	void LoadPreviewLayout();
+
+	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
+	void SavePreviewLayout();
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	FString remoteStreamIp_ = "127.0.0.1";
@@ -110,6 +135,15 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Depth Settings")
 	TObjectPtr<UTextureRenderTarget2D> resultRenderTarget_ = nullptr;
 
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Preview Layout", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float previewXPercent_ = 0.0f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Preview Layout", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float previewYPercent_ = 0.0f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Preview Layout", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float previewSizePercent_ = 0.0f;
+
 protected:
 	struct ViewSynthCameraParams
 	{
@@ -144,18 +178,27 @@ protected:
 	uint32_t frameNumber_;
 	uint64_t startTimestampMs_;
 	double captureAccumulator_ = 0.0;
+	double previewLayoutLastUiChangeTime_ = 0.0;
 
 	bool wantsStop_ = false;
+	bool previewLayoutLoaded_ = false;
+	bool previewLayoutControlsSyncInProgress_ = false;
+	bool previewLayoutSavePending_ = false;
 	bool mainMenuWidgetClassLookupAttempted_ = false;
 	bool mainMenuWidgetObserved_ = false;
-	int32 previewLastRenderTargetWidth_ = 0;
-	int32 previewLastRenderTargetHeight_ = 0;
+	bool viewSynthesisControlWidgetClassLookupAttempted_ = false;
 
 	TWeakObjectPtr<UUserWidget> mainMenuWidget_;
+	TWeakObjectPtr<UUserWidget> viewSynthesisControlWidget_;
+	TWeakObjectPtr<USpinBox> previewXSpinBox_;
+	TWeakObjectPtr<USpinBox> previewYSpinBox_;
+	TWeakObjectPtr<USpinBox> previewSizeSpinBox_;
 	UClass* mainMenuWidgetClass_ = nullptr;
+	UClass* viewSynthesisControlWidgetClass_ = nullptr;
 	TSharedPtr<SOverlay> previewOverlayWidget_;
 	TSharedPtr<SBox> previewBox_;
 	TSharedPtr<FSlateBrush> previewBrush_;
+	SOverlay::FOverlaySlot* previewOverlaySlot_ = nullptr;
 
 	virtual void BeginPlay() override;
 	virtual void PostRegisterAllComponents() override;
@@ -168,7 +211,28 @@ protected:
 	void CreatePreviewOverlay();
 	void DestroyPreviewOverlay();
 	void UpdatePreviewOverlay();
-	void UpdatePreviewOverlayDimensions();
+	void UpdatePreviewOverlayLayout();
+	void UpdatePreviewLayoutControls();
+	void TryInstallPreviewLayoutControls();
+	UUserWidget* FindViewSynthesisControlWidget();
+	AViewSynthesizer* ResolveControlledSynthesizer(UUserWidget* widget) const;
+	void ResetPreviewLayoutWidgetState();
+	float ClampPreviewPercent(float value) const;
+	void ApplyPreviewLayout(float xPercent, float yPercent, float sizePercent);
+	void ApplyLegacyPreviewLayoutDefaults();
+	void QueuePreviewLayoutSave();
+	void FlushPendingPreviewLayoutSave();
+	bool TryGetPreviewViewportSize(FVector2D& outViewportSize) const;
+
+	UFUNCTION()
+	void HandlePreviewXSpinBoxValueChanged(float value);
+
+	UFUNCTION()
+	void HandlePreviewYSpinBoxValueChanged(float value);
+
+	UFUNCTION()
+	void HandlePreviewSizeSpinBoxValueChanged(float value);
+
 	UUserWidget* FindMainMenuWidget();
 	bool IsMainMenuOpen();
 

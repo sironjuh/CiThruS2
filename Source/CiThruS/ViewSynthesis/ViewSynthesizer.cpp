@@ -29,19 +29,30 @@
 #include "Video/Pipeline/ScaffoldingParallelSource.h"
 #include "Video/Pipeline/ScaffoldingParallelSink.h"
 #include "Video/Pipeline/AsyncPipelineRunner.h"
+#include "Misc/CithrusConfig.h"
 #include "Misc/Debug.h"
 
 #include "RHI.h"
 #include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
+#include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
+#include "Components/PanelWidget.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Components/SizeBox.h"
+#include "Components/SpinBox.h"
+#include "Components/TextBlock.h"
+#include "Components/VerticalBox.h"
+#include "Components/VerticalBoxSlot.h"
 #include "ShaderParameterStruct.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "RenderResource.h"
 #include "Styling/SlateBrush.h"
+#include "UObject/UnrealType.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SOverlay.h"
@@ -51,8 +62,24 @@
 namespace
 {
 constexpr TCHAR MAIN_MENU_WIDGET_CLASS_PATH[] = TEXT("/Game/UI/WBP_MainMenu.WBP_MainMenu_C");
-constexpr float PREVIEW_MARGIN = 16.0f;
-constexpr float PREVIEW_WIDTH = 320.0f;
+constexpr TCHAR VIEW_SYNTHESIS_CONTROL_WIDGET_CLASS_PATH[] = TEXT("/Game/ViewSynthesis/ViewSynthesisControlWidget.ViewSynthesisControlWidget_C");
+constexpr TCHAR CONTROLLED_SYNTHESIZER_PROPERTY_NAME[] = TEXT("ControlledSynthesizer");
+constexpr TCHAR PREVIEW_LAYOUT_SECTION_WIDGET_NAME[] = TEXT("PreviewLayoutSection");
+constexpr TCHAR PREVIEW_X_SPIN_BOX_WIDGET_NAME[] = TEXT("PreviewLayoutXSpinBox");
+constexpr TCHAR PREVIEW_Y_SPIN_BOX_WIDGET_NAME[] = TEXT("PreviewLayoutYSpinBox");
+constexpr TCHAR PREVIEW_SIZE_SPIN_BOX_WIDGET_NAME[] = TEXT("PreviewLayoutSizeSpinBox");
+constexpr float LEGACY_PREVIEW_MARGIN = 16.0f;
+constexpr float LEGACY_PREVIEW_WIDTH = 320.0f;
+constexpr float PREVIEW_PERCENT_MIN = 0.0f;
+constexpr float PREVIEW_PERCENT_MAX = 100.0f;
+constexpr float PREVIEW_SPIN_BOX_DELTA = 0.1f;
+constexpr float PREVIEW_LAYOUT_LABEL_WIDTH = 180.0f;
+constexpr float PREVIEW_LAYOUT_ROW_PADDING = 4.0f;
+constexpr float PREVIEW_LAYOUT_SECTION_PADDING = 8.0f;
+constexpr double PREVIEW_LAYOUT_SAVE_DEBOUNCE_SECONDS = 0.25;
+constexpr int32 PREVIEW_VIEWPORT_Z_ORDER = 100;
+constexpr float LEGACY_FALLBACK_VIEWPORT_WIDTH = 1280.0f;
+constexpr float LEGACY_FALLBACK_VIEWPORT_HEIGHT = 720.0f;
 constexpr float MAIN_MENU_GRACE_PERIOD_SECONDS = 1.0f;
 }
 
@@ -76,9 +103,10 @@ AViewSynthesizer::AViewSynthesizer()
 
 void AViewSynthesizer::BeginPlay()
 {
-    Super::BeginPlay();
+	Super::BeginPlay();
 
-    CreatePreviewOverlay();
+	LoadPreviewLayout();
+	CreatePreviewOverlay();
 }
 
 void AViewSynthesizer::PostRegisterAllComponents()
@@ -108,9 +136,11 @@ void AViewSynthesizer::PostRegisterAllComponents()
 
 void AViewSynthesizer::EndPlay(const EEndPlayReason::Type endPlayReason)
 {
-    DestroyPreviewOverlay();
+	FlushPendingPreviewLayoutSave();
+	DestroyPreviewOverlay();
+	ResetPreviewLayoutWidgetState();
 
-    Super::EndPlay(endPlayReason);
+	Super::EndPlay(endPlayReason);
 
 	DeleteStreams();
 }
@@ -119,32 +149,34 @@ void AViewSynthesizer::Tick(float deltaTime)
 {
 	Super::Tick(deltaTime);
 
-    UpdatePreviewOverlay();
+	UpdatePreviewOverlay();
+	TryInstallPreviewLayoutControls();
+	FlushPendingPreviewLayoutSave();
 
-    if (wantsStop_)
-    {
-        StopTransmitInternal();
-    }
+	if (wantsStop_)
+	{
+		StopTransmitInternal();
+	}
 
-    const std::lock_guard<std::mutex> lock(streamMutex_);
+	const std::lock_guard<std::mutex> lock(streamMutex_);
 
-    if (!transmitEnabled_)
-    {
-        return;
-    }
+	if (!transmitEnabled_)
+	{
+		return;
+	}
 
-    if (!saveToFile_ && maxStreamFps_ > 0)
-    {
-        const double frameInterval = 1.0 / static_cast<double>(maxStreamFps_);
-        captureAccumulator_ += static_cast<double>(deltaTime);
-        if (captureAccumulator_ < frameInterval)
-        {
-            return;
-        }
-        captureAccumulator_ = std::min(captureAccumulator_ - frameInterval, frameInterval);
-    }
+	if (!saveToFile_ && maxStreamFps_ > 0)
+	{
+		const double frameInterval = 1.0 / static_cast<double>(maxStreamFps_);
+		captureAccumulator_ += static_cast<double>(deltaTime);
+		if (captureAccumulator_ < frameInterval)
+		{
+			return;
+		}
+		captureAccumulator_ = std::min(captureAccumulator_ - frameInterval, frameInterval);
+	}
 
-    Capture();
+	Capture();
 }
 
 void AViewSynthesizer::StartTransmit()
@@ -161,8 +193,68 @@ void AViewSynthesizer::StartTransmit()
 
 void AViewSynthesizer::StopTransmit()
 {
-    // Stop the transmit in a synchronized manner to avoid race conditions
-    wantsStop_ = true;
+	// Stop the transmit in a synchronized manner to avoid race conditions
+	wantsStop_ = true;
+}
+
+void AViewSynthesizer::SetPreviewXPercent(float value)
+{
+	previewXPercent_ = ClampPreviewPercent(value);
+	UpdatePreviewOverlayLayout();
+	UpdatePreviewLayoutControls();
+}
+
+void AViewSynthesizer::SetPreviewYPercent(float value)
+{
+	previewYPercent_ = ClampPreviewPercent(value);
+	UpdatePreviewOverlayLayout();
+	UpdatePreviewLayoutControls();
+}
+
+void AViewSynthesizer::SetPreviewSizePercent(float value)
+{
+	previewSizePercent_ = ClampPreviewPercent(value);
+	UpdatePreviewOverlayLayout();
+	UpdatePreviewLayoutControls();
+}
+
+float AViewSynthesizer::GetPreviewXPercent() const
+{
+	return previewXPercent_;
+}
+
+float AViewSynthesizer::GetPreviewYPercent() const
+{
+	return previewYPercent_;
+}
+
+float AViewSynthesizer::GetPreviewSizePercent() const
+{
+	return previewSizePercent_;
+}
+
+void AViewSynthesizer::LoadPreviewLayout()
+{
+	float loadedXPercent = 0.0f;
+	float loadedYPercent = 0.0f;
+	float loadedSizePercent = 0.0f;
+
+	if (UCithrusConfig::LoadViewSynthPreviewLayout(loadedXPercent, loadedYPercent, loadedSizePercent))
+	{
+		ApplyPreviewLayout(loadedXPercent, loadedYPercent, loadedSizePercent);
+	}
+	else
+	{
+		ApplyLegacyPreviewLayoutDefaults();
+	}
+
+	previewLayoutLoaded_ = true;
+}
+
+void AViewSynthesizer::SavePreviewLayout()
+{
+	UCithrusConfig::SaveViewSynthPreviewLayout(previewXPercent_, previewYPercent_, previewSizePercent_);
+	previewLayoutSavePending_ = false;
 }
 
 bool AViewSynthesizer::StartStreams()
@@ -204,7 +296,7 @@ bool AViewSynthesizer::StartStreams()
     frontRenderTarget_->ResizeTarget(frameWidth, frameHeight);
     rearRenderTarget_->ResizeTarget(frameWidth, frameHeight);
     resultRenderTarget_->ResizeTarget(frameWidth, frameHeight);
-    UpdatePreviewOverlayDimensions();
+    UpdatePreviewOverlayLayout();
 
     try
     {
@@ -438,123 +530,461 @@ void AViewSynthesizer::Capture()
 
 void AViewSynthesizer::CreatePreviewOverlay()
 {
-    if (previewOverlayWidget_.IsValid() || !resultRenderTarget_ || !GetWorld() || !GetWorld()->IsGameWorld() || !GEngine || !GEngine->GameViewport)
-    {
-        return;
-    }
+	if (previewOverlayWidget_.IsValid() || !resultRenderTarget_ || !GetWorld() || !GetWorld()->IsGameWorld() || !GEngine || !GEngine->GameViewport)
+	{
+		return;
+	}
 
-    previewBrush_ = MakeShared<FSlateBrush>();
-    previewBrush_->SetResourceObject(resultRenderTarget_);
-    previewBrush_->DrawAs = ESlateBrushDrawType::Image;
-    previewBrush_->TintColor = FSlateColor(FLinearColor::White);
+	if (!previewLayoutLoaded_)
+	{
+		LoadPreviewLayout();
+	}
 
-    UpdatePreviewOverlayDimensions();
+	previewBrush_ = MakeShared<FSlateBrush>();
+	previewBrush_->SetResourceObject(resultRenderTarget_);
+	previewBrush_->DrawAs = ESlateBrushDrawType::Image;
+	previewBrush_->TintColor = FSlateColor(FLinearColor::White);
 
-    GEngine->GameViewport->AddViewportWidgetContent(
-        SAssignNew(previewOverlayWidget_, SOverlay)
-        + SOverlay::Slot()
-        .HAlign(HAlign_Left)
-        .VAlign(VAlign_Top)
-        .Padding(FMargin(PREVIEW_MARGIN))
-        [
-            SAssignNew(previewBox_, SBox)
-            .WidthOverride(previewBrush_->ImageSize.X)
-            .HeightOverride(previewBrush_->ImageSize.Y)
-            [
-                SNew(SImage)
-                .Image(previewBrush_.Get())
-            ]
-        ],
-        1);
+	GEngine->GameViewport->AddViewportWidgetContent(
+		SAssignNew(previewOverlayWidget_, SOverlay)
+		+ SOverlay::Slot()
+		.Expose(previewOverlaySlot_)
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Top)
+		.Padding(FMargin(0.0f))
+		[
+			SAssignNew(previewBox_, SBox)
+			[
+				SNew(SImage)
+				.Image(previewBrush_.Get())
+			]
+		],
+		PREVIEW_VIEWPORT_Z_ORDER);
 
-    if (previewOverlayWidget_.IsValid())
-    {
-        previewOverlayWidget_->SetVisibility(EVisibility::Collapsed);
-    }
+	UpdatePreviewOverlayLayout();
 
-    UpdatePreviewOverlay();
+	if (previewOverlayWidget_.IsValid())
+	{
+		previewOverlayWidget_->SetVisibility(EVisibility::HitTestInvisible);
+	}
 }
 
 void AViewSynthesizer::DestroyPreviewOverlay()
 {
-    if (!previewOverlayWidget_.IsValid())
-    {
-        return;
-    }
+	if (!previewOverlayWidget_.IsValid())
+	{
+		return;
+	}
 
-    if (GEngine && GEngine->GameViewport)
-    {
-        GEngine->GameViewport->RemoveViewportWidgetContent(previewOverlayWidget_.ToSharedRef());
-    }
+	if (GEngine && GEngine->GameViewport)
+	{
+		GEngine->GameViewport->RemoveViewportWidgetContent(previewOverlayWidget_.ToSharedRef());
+	}
 
-    previewOverlayWidget_.Reset();
-    previewBox_.Reset();
-    previewBrush_.Reset();
-    previewLastRenderTargetWidth_ = 0;
-    previewLastRenderTargetHeight_ = 0;
+	previewOverlaySlot_ = nullptr;
+	previewOverlayWidget_.Reset();
+	previewBox_.Reset();
+	previewBrush_.Reset();
 }
 
 void AViewSynthesizer::UpdatePreviewOverlay()
 {
-    if (!GetWorld() || !GetWorld()->IsGameWorld())
-    {
-        return;
-    }
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		return;
+	}
 
-    if (!previewOverlayWidget_.IsValid())
-    {
-        CreatePreviewOverlay();
-    }
+	if (!previewOverlayWidget_.IsValid())
+	{
+		CreatePreviewOverlay();
+	}
 
-    if (!previewOverlayWidget_.IsValid())
-    {
-        return;
-    }
+	if (!previewOverlayWidget_.IsValid())
+	{
+		return;
+	}
 
-    UpdatePreviewOverlayDimensions();
-
-    previewOverlayWidget_->SetVisibility(IsMainMenuOpen() ? EVisibility::Collapsed : EVisibility::Visible);
+	UpdatePreviewOverlayLayout();
+	previewOverlayWidget_->SetVisibility(EVisibility::HitTestInvisible);
 }
 
-void AViewSynthesizer::UpdatePreviewOverlayDimensions()
+void AViewSynthesizer::UpdatePreviewOverlayLayout()
 {
-    if (!resultRenderTarget_ || !previewBrush_.IsValid())
-    {
-        return;
-    }
+	if (!resultRenderTarget_ || !previewBrush_.IsValid())
+	{
+		return;
+	}
 
-    const int32 renderTargetWidth = resultRenderTarget_->SizeX;
-    const int32 renderTargetHeight = resultRenderTarget_->SizeY;
+	FVector2D viewportSize;
+	if (!TryGetPreviewViewportSize(viewportSize))
+	{
+		return;
+	}
 
-    if (renderTargetWidth <= 0 || renderTargetHeight <= 0)
-    {
-        previewBrush_->ImageSize = FVector2D(PREVIEW_WIDTH, PREVIEW_WIDTH);
+	float renderTargetWidth = static_cast<float>(resultRenderTarget_->SizeX);
+	float renderTargetHeight = static_cast<float>(resultRenderTarget_->SizeY);
+	if (renderTargetWidth <= 0.0f || renderTargetHeight <= 0.0f)
+	{
+		renderTargetWidth = 1.0f;
+		renderTargetHeight = 1.0f;
+	}
 
-        if (previewBox_.IsValid())
-        {
-            previewBox_->SetWidthOverride(PREVIEW_WIDTH);
-            previewBox_->SetHeightOverride(PREVIEW_WIDTH);
-        }
+	const float maxPreviewWidth = FMath::Max(0.0f, FMath::Min(viewportSize.X, viewportSize.Y * renderTargetWidth / renderTargetHeight));
+	const float previewWidth = maxPreviewWidth * previewSizePercent_ / PREVIEW_PERCENT_MAX;
+	const float previewHeight = previewWidth * renderTargetHeight / renderTargetWidth;
+	const float desiredX = viewportSize.X * previewXPercent_ / PREVIEW_PERCENT_MAX;
+	const float desiredY = viewportSize.Y * previewYPercent_ / PREVIEW_PERCENT_MAX;
+	const float clampedX = FMath::Clamp(desiredX, 0.0f, FMath::Max(0.0f, viewportSize.X - previewWidth));
+	const float clampedY = FMath::Clamp(desiredY, 0.0f, FMath::Max(0.0f, viewportSize.Y - previewHeight));
 
-        return;
-    }
+	previewBrush_->ImageSize = FVector2D(previewWidth, previewHeight);
 
-    if (renderTargetWidth == previewLastRenderTargetWidth_ && renderTargetHeight == previewLastRenderTargetHeight_)
-    {
-        return;
-    }
+	if (previewBox_.IsValid())
+	{
+		previewBox_->SetWidthOverride(previewWidth);
+		previewBox_->SetHeightOverride(previewHeight);
+	}
 
-    previewLastRenderTargetWidth_ = renderTargetWidth;
-    previewLastRenderTargetHeight_ = renderTargetHeight;
+	if (previewOverlaySlot_)
+	{
+		previewOverlaySlot_->SetPadding(FMargin(clampedX, clampedY, 0.0f, 0.0f));
+	}
+}
 
-    const float previewHeight = PREVIEW_WIDTH * static_cast<float>(renderTargetHeight) / static_cast<float>(renderTargetWidth);
-    previewBrush_->ImageSize = FVector2D(PREVIEW_WIDTH, previewHeight);
+void AViewSynthesizer::UpdatePreviewLayoutControls()
+{
+	if (!previewXSpinBox_.IsValid() || !previewYSpinBox_.IsValid() || !previewSizeSpinBox_.IsValid())
+	{
+		return;
+	}
 
-    if (previewBox_.IsValid())
-    {
-        previewBox_->SetWidthOverride(PREVIEW_WIDTH);
-        previewBox_->SetHeightOverride(previewHeight);
-    }
+	previewLayoutControlsSyncInProgress_ = true;
+	previewXSpinBox_->SetValue(previewXPercent_);
+	previewYSpinBox_->SetValue(previewYPercent_);
+	previewSizeSpinBox_->SetValue(previewSizePercent_);
+	previewLayoutControlsSyncInProgress_ = false;
+}
+
+void AViewSynthesizer::TryInstallPreviewLayoutControls()
+{
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		return;
+	}
+
+	UUserWidget* controlWidget = FindViewSynthesisControlWidget();
+	if (!controlWidget)
+	{
+		ResetPreviewLayoutWidgetState();
+		return;
+	}
+
+	if (AViewSynthesizer* controlledSynthesizer = ResolveControlledSynthesizer(controlWidget))
+	{
+		if (controlledSynthesizer != this)
+		{
+			return;
+		}
+	}
+
+	UWidgetTree* widgetTree = controlWidget->WidgetTree;
+	if (!widgetTree)
+	{
+		return;
+	}
+
+	if (!previewXSpinBox_.IsValid())
+	{
+		previewXSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_X_SPIN_BOX_WIDGET_NAME)));
+	}
+
+	if (!previewYSpinBox_.IsValid())
+	{
+		previewYSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_Y_SPIN_BOX_WIDGET_NAME)));
+	}
+
+	if (!previewSizeSpinBox_.IsValid())
+	{
+		previewSizeSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_SIZE_SPIN_BOX_WIDGET_NAME)));
+	}
+
+	if (!previewXSpinBox_.IsValid() || !previewYSpinBox_.IsValid() || !previewSizeSpinBox_.IsValid())
+	{
+		UVerticalBox* container = nullptr;
+		int32 largestContainerChildCount = INDEX_NONE;
+
+		TArray<UWidget*> allWidgets;
+		widgetTree->GetAllWidgets(allWidgets);
+		for (UWidget* widget : allWidgets)
+		{
+			UVerticalBox* candidate = Cast<UVerticalBox>(widget);
+			if (!candidate)
+			{
+				continue;
+			}
+
+			const int32 childCount = candidate->GetChildrenCount();
+			if (childCount > largestContainerChildCount)
+			{
+				container = candidate;
+				largestContainerChildCount = childCount;
+			}
+		}
+
+		if (!container)
+		{
+			return;
+		}
+
+		UVerticalBox* previewSection = widgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), FName(PREVIEW_LAYOUT_SECTION_WIDGET_NAME));
+		UTextBlock* sectionHeader = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+		sectionHeader->SetText(FText::FromString(TEXT("Preview Layout")));
+
+		if (UVerticalBoxSlot* headerSlot = previewSection->AddChildToVerticalBox(sectionHeader))
+		{
+			headerSlot->SetPadding(FMargin(0.0f, PREVIEW_LAYOUT_SECTION_PADDING, 0.0f, PREVIEW_LAYOUT_ROW_PADDING));
+		}
+
+		auto AddPreviewSpinBoxRow = [&](const TCHAR* spinBoxWidgetName, const TCHAR* labelText) -> USpinBox*
+		{
+			UHorizontalBox* row = widgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+			USizeBox* labelBox = widgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			labelBox->SetWidthOverride(PREVIEW_LAYOUT_LABEL_WIDTH);
+
+			UTextBlock* label = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+			label->SetText(FText::FromString(labelText));
+			labelBox->AddChild(label);
+
+			if (UHorizontalBoxSlot* labelSlot = row->AddChildToHorizontalBox(labelBox))
+			{
+				labelSlot->SetVerticalAlignment(VAlign_Center);
+			}
+
+			USpinBox* spinBox = widgetTree->ConstructWidget<USpinBox>(USpinBox::StaticClass(), FName(spinBoxWidgetName));
+			spinBox->SetMinValue(PREVIEW_PERCENT_MIN);
+			spinBox->SetMaxValue(PREVIEW_PERCENT_MAX);
+			spinBox->SetDelta(PREVIEW_SPIN_BOX_DELTA);
+			spinBox->SetMinFractionalDigits(1);
+			spinBox->SetMaxFractionalDigits(1);
+
+			if (UHorizontalBoxSlot* spinBoxSlot = row->AddChildToHorizontalBox(spinBox))
+			{
+				spinBoxSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				spinBoxSlot->SetVerticalAlignment(VAlign_Center);
+			}
+
+			if (UVerticalBoxSlot* rowSlot = previewSection->AddChildToVerticalBox(row))
+			{
+				rowSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, PREVIEW_LAYOUT_ROW_PADDING));
+			}
+
+			return spinBox;
+		};
+
+		previewXSpinBox_ = AddPreviewSpinBoxRow(PREVIEW_X_SPIN_BOX_WIDGET_NAME, TEXT("Preview X (%)"));
+		previewYSpinBox_ = AddPreviewSpinBoxRow(PREVIEW_Y_SPIN_BOX_WIDGET_NAME, TEXT("Preview Y (%)"));
+		previewSizeSpinBox_ = AddPreviewSpinBoxRow(PREVIEW_SIZE_SPIN_BOX_WIDGET_NAME, TEXT("Preview Size (%)"));
+
+		if (UVerticalBoxSlot* sectionSlot = container->AddChildToVerticalBox(previewSection))
+		{
+			sectionSlot->SetPadding(FMargin(0.0f, PREVIEW_LAYOUT_SECTION_PADDING, 0.0f, 0.0f));
+		}
+	}
+
+	if (previewXSpinBox_.IsValid())
+	{
+		previewXSpinBox_->OnValueChanged.AddUniqueDynamic(this, &AViewSynthesizer::HandlePreviewXSpinBoxValueChanged);
+	}
+
+	if (previewYSpinBox_.IsValid())
+	{
+		previewYSpinBox_->OnValueChanged.AddUniqueDynamic(this, &AViewSynthesizer::HandlePreviewYSpinBoxValueChanged);
+	}
+
+	if (previewSizeSpinBox_.IsValid())
+	{
+		previewSizeSpinBox_->OnValueChanged.AddUniqueDynamic(this, &AViewSynthesizer::HandlePreviewSizeSpinBoxValueChanged);
+	}
+
+	UpdatePreviewLayoutControls();
+}
+
+UUserWidget* AViewSynthesizer::FindViewSynthesisControlWidget()
+{
+	if (viewSynthesisControlWidget_.IsValid())
+	{
+		return viewSynthesisControlWidget_.Get();
+	}
+
+	if (!viewSynthesisControlWidgetClassLookupAttempted_)
+	{
+		viewSynthesisControlWidgetClassLookupAttempted_ = true;
+		viewSynthesisControlWidgetClass_ = LoadClass<UUserWidget>(nullptr, VIEW_SYNTHESIS_CONTROL_WIDGET_CLASS_PATH);
+	}
+
+	if (!viewSynthesisControlWidgetClass_)
+	{
+		return nullptr;
+	}
+
+	TArray<UUserWidget*> widgets;
+	UWidgetBlueprintLibrary::GetAllWidgetsOfClass(this, widgets, viewSynthesisControlWidgetClass_, false);
+
+	for (UUserWidget* widget : widgets)
+	{
+		if (ResolveControlledSynthesizer(widget) == this)
+		{
+			viewSynthesisControlWidget_ = widget;
+			return widget;
+		}
+	}
+
+	if (widgets.Num() == 1 && !ResolveControlledSynthesizer(widgets[0]))
+	{
+		viewSynthesisControlWidget_ = widgets[0];
+		return widgets[0];
+	}
+
+	return nullptr;
+}
+
+AViewSynthesizer* AViewSynthesizer::ResolveControlledSynthesizer(UUserWidget* widget) const
+{
+	if (!widget)
+	{
+		return nullptr;
+	}
+
+	const FObjectProperty* controlledSynthesizerProperty = FindFProperty<FObjectProperty>(widget->GetClass(), CONTROLLED_SYNTHESIZER_PROPERTY_NAME);
+	if (!controlledSynthesizerProperty)
+	{
+		return nullptr;
+	}
+
+	return Cast<AViewSynthesizer>(controlledSynthesizerProperty->GetObjectPropertyValue_InContainer(widget));
+}
+
+void AViewSynthesizer::ResetPreviewLayoutWidgetState()
+{
+	viewSynthesisControlWidget_.Reset();
+	previewXSpinBox_.Reset();
+	previewYSpinBox_.Reset();
+	previewSizeSpinBox_.Reset();
+}
+
+float AViewSynthesizer::ClampPreviewPercent(float value) const
+{
+	return FMath::Clamp(value, PREVIEW_PERCENT_MIN, PREVIEW_PERCENT_MAX);
+}
+
+void AViewSynthesizer::ApplyPreviewLayout(float xPercent, float yPercent, float sizePercent)
+{
+	previewXPercent_ = ClampPreviewPercent(xPercent);
+	previewYPercent_ = ClampPreviewPercent(yPercent);
+	previewSizePercent_ = ClampPreviewPercent(sizePercent);
+	UpdatePreviewOverlayLayout();
+	UpdatePreviewLayoutControls();
+}
+
+void AViewSynthesizer::ApplyLegacyPreviewLayoutDefaults()
+{
+	FVector2D viewportSize;
+	if (!TryGetPreviewViewportSize(viewportSize))
+	{
+		viewportSize = FVector2D(LEGACY_FALLBACK_VIEWPORT_WIDTH, LEGACY_FALLBACK_VIEWPORT_HEIGHT);
+	}
+
+	float renderTargetWidth = static_cast<float>(resultRenderTarget_ ? resultRenderTarget_->SizeX : 0);
+	float renderTargetHeight = static_cast<float>(resultRenderTarget_ ? resultRenderTarget_->SizeY : 0);
+	if (renderTargetWidth <= 0.0f || renderTargetHeight <= 0.0f)
+	{
+		renderTargetWidth = 1.0f;
+		renderTargetHeight = 1.0f;
+	}
+
+	const float maxPreviewWidth = FMath::Max(0.0f, FMath::Min(viewportSize.X, viewportSize.Y * renderTargetWidth / renderTargetHeight));
+	const float legacyXPercent = viewportSize.X > 0.0f ? (LEGACY_PREVIEW_MARGIN / viewportSize.X) * PREVIEW_PERCENT_MAX : 0.0f;
+	const float legacyYPercent = viewportSize.Y > 0.0f ? (LEGACY_PREVIEW_MARGIN / viewportSize.Y) * PREVIEW_PERCENT_MAX : 0.0f;
+	const float legacySizePercent = maxPreviewWidth > 0.0f ? (LEGACY_PREVIEW_WIDTH / maxPreviewWidth) * PREVIEW_PERCENT_MAX : PREVIEW_PERCENT_MAX;
+
+	ApplyPreviewLayout(legacyXPercent, legacyYPercent, legacySizePercent);
+}
+
+void AViewSynthesizer::QueuePreviewLayoutSave()
+{
+	if (!GetWorld())
+	{
+		return;
+	}
+
+	previewLayoutSavePending_ = true;
+	previewLayoutLastUiChangeTime_ = static_cast<double>(GetWorld()->GetRealTimeSeconds());
+}
+
+void AViewSynthesizer::FlushPendingPreviewLayoutSave()
+{
+	if (!previewLayoutSavePending_ || !GetWorld())
+	{
+		return;
+	}
+
+	const double secondsSinceLastChange = static_cast<double>(GetWorld()->GetRealTimeSeconds()) - previewLayoutLastUiChangeTime_;
+	if (secondsSinceLastChange < PREVIEW_LAYOUT_SAVE_DEBOUNCE_SECONDS)
+	{
+		return;
+	}
+
+	SavePreviewLayout();
+}
+
+bool AViewSynthesizer::TryGetPreviewViewportSize(FVector2D& outViewportSize) const
+{
+	if (!GEngine || !GEngine->GameViewport || !GEngine->GameViewport->Viewport)
+	{
+		return false;
+	}
+
+	const FIntPoint viewportSize = GEngine->GameViewport->Viewport->GetSizeXY();
+	if (viewportSize.X <= 0 || viewportSize.Y <= 0)
+	{
+		return false;
+	}
+
+	outViewportSize = FVector2D(viewportSize);
+	return true;
+}
+
+void AViewSynthesizer::HandlePreviewXSpinBoxValueChanged(float value)
+{
+	if (previewLayoutControlsSyncInProgress_)
+	{
+		return;
+	}
+
+	SetPreviewXPercent(value);
+	QueuePreviewLayoutSave();
+}
+
+void AViewSynthesizer::HandlePreviewYSpinBoxValueChanged(float value)
+{
+	if (previewLayoutControlsSyncInProgress_)
+	{
+		return;
+	}
+
+	SetPreviewYPercent(value);
+	QueuePreviewLayoutSave();
+}
+
+void AViewSynthesizer::HandlePreviewSizeSpinBoxValueChanged(float value)
+{
+	if (previewLayoutControlsSyncInProgress_)
+	{
+		return;
+	}
+
+	SetPreviewSizePercent(value);
+	QueuePreviewLayoutSave();
 }
 
 UUserWidget* AViewSynthesizer::FindMainMenuWidget()
