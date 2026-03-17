@@ -73,11 +73,13 @@ constexpr float LEGACY_PREVIEW_WIDTH = 320.0f;
 constexpr float PREVIEW_PERCENT_MIN = 0.0f;
 constexpr float PREVIEW_PERCENT_MAX = 100.0f;
 constexpr float PREVIEW_SPIN_BOX_DELTA = 0.1f;
-constexpr float PREVIEW_LAYOUT_LABEL_WIDTH = 180.0f;
+constexpr float PREVIEW_LAYOUT_LABEL_WIDTH = 150.0f;
 constexpr float PREVIEW_LAYOUT_ROW_PADDING = 4.0f;
 constexpr float PREVIEW_LAYOUT_SECTION_PADDING = 8.0f;
+constexpr int32 PREVIEW_LAYOUT_HEADER_FONT_SIZE = 18;
+constexpr int32 PREVIEW_LAYOUT_LABEL_FONT_SIZE = 14;
 constexpr double PREVIEW_LAYOUT_SAVE_DEBOUNCE_SECONDS = 0.25;
-constexpr int32 PREVIEW_VIEWPORT_Z_ORDER = 100;
+constexpr int32 PREVIEW_VIEWPORT_Z_ORDER = -1;
 constexpr float LEGACY_FALLBACK_VIEWPORT_WIDTH = 1280.0f;
 constexpr float LEGACY_FALLBACK_VIEWPORT_HEIGHT = 720.0f;
 constexpr float MAIN_MENU_GRACE_PERIOD_SECONDS = 1.0f;
@@ -739,6 +741,12 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 		UVerticalBox* previewSection = widgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), FName(PREVIEW_LAYOUT_SECTION_WIDGET_NAME));
 		UTextBlock* sectionHeader = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
 		sectionHeader->SetText(FText::FromString(TEXT("Preview Layout")));
+		sectionHeader->SetJustification(ETextJustify::Center);
+		{
+			FSlateFontInfo sectionHeaderFont = sectionHeader->GetFont();
+			sectionHeaderFont.Size = PREVIEW_LAYOUT_HEADER_FONT_SIZE;
+			sectionHeader->SetFont(sectionHeaderFont);
+		}
 
 		if (UVerticalBoxSlot* headerSlot = previewSection->AddChildToVerticalBox(sectionHeader))
 		{
@@ -753,6 +761,11 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 
 			UTextBlock* label = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
 			label->SetText(FText::FromString(labelText));
+			{
+				FSlateFontInfo labelFont = label->GetFont();
+				labelFont.Size = PREVIEW_LAYOUT_LABEL_FONT_SIZE;
+				label->SetFont(labelFont);
+			}
 			labelBox->AddChild(label);
 
 			if (UHorizontalBoxSlot* labelSlot = row->AddChildToHorizontalBox(labelBox))
