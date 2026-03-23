@@ -37,6 +37,7 @@ public:
 	virtual void Process() override
 	{
 		const int frameSize = inputFrameWidth_ * inputFrameHeight_;
+		bool inputsValid = true;
 
 		TemplateUtility::For<N>([&, this]<uint8_t i>()
 		{
@@ -45,8 +46,20 @@ public:
 
 			if (!inputData || inputSize != frameSize * 3 / 2)
 			{
-				return;
+				inputsValid = false;
 			}
+		});
+
+		if (!inputsValid)
+		{
+			PipelineSource<1>::GetOutputPin<0>().SetData(nullptr);
+			PipelineSource<1>::GetOutputPin<0>().SetSize(0);
+			return;
+		}
+
+		TemplateUtility::For<N>([&, this]<uint8_t i>()
+		{
+			const uint8_t* inputData = this->template GetInputPin<i>().GetData();
 
 			// Copy Y
 			memcpy(outputData_ + frameSize * i, inputData, frameSize);
@@ -55,6 +68,9 @@ public:
 			// Copy V
 			memcpy(outputData_ + frameSize / 4 * i + frameSize * 5 / 4 * N, inputData + frameSize * 5 / 4, frameSize / 4);
 		});
+
+		PipelineSource<1>::GetOutputPin<0>().SetData(outputData_);
+		PipelineSource<1>::GetOutputPin<0>().SetSize(frameSize * N * 3 / 2);
 	}
 
 protected:

@@ -47,7 +47,7 @@ public:
 		const uint8_t& owf,
 		const HevcEncoderPreset& preset = HevcPresetNone,
 		const EHevcEncoderBackend& requestedBackend = EHevcEncoderBackend::Auto,
-		const float& targetBitrateMbps = 1.5f,
+		const float& targetBitrateMbps = 2.0f,
 		const uint32_t& maxKeyFrameInterval = 60,
 		const uint32_t& expectedFrameRate = 60,
 		const uint32_t& perfLogInterval = 120,

@@ -4,7 +4,9 @@
 #include "StreamPerfStats.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <thread>
 
@@ -616,10 +618,14 @@ bool HevcEncoder::InitializeVideoToolbox(bool requireHardware)
 
 	CFMutableDictionaryRef encoderSpec = CFDictionaryCreateMutable(
 		kCFAllocatorDefault,
-		2,
+		3,
 		&kCFTypeDictionaryKeyCallBacks,
 		&kCFTypeDictionaryValueCallBacks);
 	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+	if (preset_ == HevcPresetMinimumLatency)
+	{
+		CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
+	}
 	if (requireHardware)
 	{
 		CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
@@ -679,6 +685,14 @@ bool HevcEncoder::InitializeVideoToolbox(bool requireHardware)
 
 	OSStatus propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
 	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set RealTime: %d"), static_cast<int>(propertyStatus)); }
+	if (preset_ == HevcPresetMinimumLatency)
+	{
+		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
+		if (propertyStatus != noErr && propertyStatus != kVTPropertyNotSupportedErr)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set PrioritizeEncodingSpeedOverQuality: %d"), static_cast<int>(propertyStatus));
+		}
+	}
 	propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
 	if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AllowFrameReordering: %d"), static_cast<int>(propertyStatus)); }
 	int32_t maxDelay = 1;
@@ -712,20 +726,31 @@ bool HevcEncoder::InitializeVideoToolbox(bool requireHardware)
 	}
 	else
 	{
-		int32_t targetBitrate = static_cast<int32_t>(std::max(0.1f, targetBitrateMbps_) * 1024.0f * 1024.0f);
-		CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &targetBitrate);
+		const double targetBitrateMbps = std::max(static_cast<double>(targetBitrateMbps_), 0.1);
+		const int64_t targetBitrateBitsPerSecond64 = static_cast<int64_t>(std::llround(targetBitrateMbps * 1000.0 * 1000.0));
+		const int32_t targetBitrateBitsPerSecond = static_cast<int32_t>(
+			std::min<int64_t>(targetBitrateBitsPerSecond64, static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+		const int64_t targetBytesPerSecond = std::max<int64_t>(1, targetBitrateBitsPerSecond64 / 8);
+		const int64_t halfSecondBytes = std::max<int64_t>(1, targetBytesPerSecond / 2);
+		const double halfSecondWindowSeconds = 0.5;
+		const double oneSecondWindowSeconds = 1.0;
+
+		CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &targetBitrateBitsPerSecond);
 		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
 		CFRelease(bitrateNum);
 		if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set AverageBitRate: %d"), static_cast<int>(propertyStatus)); }
 
-		int32_t dataRateLimits[2] = { targetBitrate / 8, 1 };
-		CFNumberRef dataRateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[0]);
-		CFNumberRef dataRateDuration = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &dataRateLimits[1]);
-		const void* limitValues[] = { dataRateNum, dataRateDuration };
-		CFArrayRef dataRateLimitsArray = CFArrayCreate(kCFAllocatorDefault, limitValues, 2, &kCFTypeArrayCallBacks);
+		CFNumberRef halfSecondBytesNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &halfSecondBytes);
+		CFNumberRef halfSecondWindowNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &halfSecondWindowSeconds);
+		CFNumberRef oneSecondBytesNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &targetBytesPerSecond);
+		CFNumberRef oneSecondWindowNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &oneSecondWindowSeconds);
+		const void* limitValues[] = { halfSecondBytesNum, halfSecondWindowNum, oneSecondBytesNum, oneSecondWindowNum };
+		CFArrayRef dataRateLimitsArray = CFArrayCreate(kCFAllocatorDefault, limitValues, 4, &kCFTypeArrayCallBacks);
 		propertyStatus = VTSessionSetProperty(compressionSession_, kVTCompressionPropertyKey_DataRateLimits, dataRateLimitsArray);
-		CFRelease(dataRateNum);
-		CFRelease(dataRateDuration);
+		CFRelease(halfSecondBytesNum);
+		CFRelease(halfSecondWindowNum);
+		CFRelease(oneSecondBytesNum);
+		CFRelease(oneSecondWindowNum);
 		CFRelease(dataRateLimitsArray);
 		if (propertyStatus != noErr) { UE_LOG(LogTemp, Warning, TEXT("VT: Failed to set DataRateLimits: %d"), static_cast<int>(propertyStatus)); }
 	}

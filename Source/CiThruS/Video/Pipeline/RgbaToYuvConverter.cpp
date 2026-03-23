@@ -204,7 +204,12 @@ void RgbaToYuvConverter::Process()
 {
     LogCompileTimeArchOnce();
     const uint8_t* inputData = GetInputPin<0>().GetData(); uint32_t inputSize = GetInputPin<0>().GetSize();
-    if (!inputData || inputSize != outputFrameWidth_ * outputFrameHeight_ * 4) { return; }
+    if (!inputData || inputSize != outputFrameWidth_ * outputFrameHeight_ * 4)
+    {
+        GetOutputPin<0>().SetData(nullptr);
+        GetOutputPin<0>().SetSize(0);
+        return;
+    }
     if ((outputFrameWidth_ & 1) || (outputFrameHeight_ & 1)) { UE_LOG(LogTemp, Warning, TEXT("RgbaToYuvConverter: Non-even dimensions %d x %d; YUV420 expects even dimensions."), outputFrameWidth_, outputFrameHeight_); }
     const bool isRGBA = (GetInputPin<0>().GetFormat() == "rgba");
 #if defined(CITHRUS_NEON_AVAILABLE)
@@ -226,6 +231,8 @@ void RgbaToYuvConverter::Process()
 #else
     RgbaToYuvScalar_impl(inputData, outputData_, outputFrameWidth_, outputFrameHeight_, isRGBA);
 #endif
+    GetOutputPin<0>().SetData(outputData_);
+    GetOutputPin<0>().SetSize(outputFrameWidth_ * outputFrameHeight_ * 3 / 2);
 }
 
 void RgbaToYuvConverter::RgbaToYuvSse41(const uint8_t* input, uint8_t** output, int width, int height)

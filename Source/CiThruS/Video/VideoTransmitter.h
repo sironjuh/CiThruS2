@@ -66,7 +66,7 @@ public:
 	bool dropFramesWhenBusy_ = true;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
-	float targetBitrateMbps_ = 1.5f;
+	float targetBitrateMbps_ = 2.0f;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	int maxKeyFrameInterval_ = 60;

@@ -39,6 +39,7 @@
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/PanelWidget.h"
+#include "Components/CheckBox.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -64,6 +65,8 @@ namespace
 constexpr TCHAR MAIN_MENU_WIDGET_CLASS_PATH[] = TEXT("/Game/UI/WBP_MainMenu.WBP_MainMenu_C");
 constexpr TCHAR VIEW_SYNTHESIS_CONTROL_WIDGET_CLASS_PATH[] = TEXT("/Game/ViewSynthesis/ViewSynthesisControlWidget.ViewSynthesisControlWidget_C");
 constexpr TCHAR CONTROLLED_SYNTHESIZER_PROPERTY_NAME[] = TEXT("ControlledSynthesizer");
+constexpr TCHAR OUTGOING_STREAM_SECTION_WIDGET_NAME[] = TEXT("OutgoingStreamSection");
+constexpr TCHAR LEGACY_PACKED_STREAM_FORMAT_CHECK_BOX_WIDGET_NAME[] = TEXT("LegacyPackedStreamFormatCheckBox");
 constexpr TCHAR PREVIEW_LAYOUT_SECTION_WIDGET_NAME[] = TEXT("PreviewLayoutSection");
 constexpr TCHAR PREVIEW_X_SPIN_BOX_WIDGET_NAME[] = TEXT("PreviewLayoutXSpinBox");
 constexpr TCHAR PREVIEW_Y_SPIN_BOX_WIDGET_NAME[] = TEXT("PreviewLayoutYSpinBox");
@@ -169,13 +172,17 @@ void AViewSynthesizer::Tick(float deltaTime)
 
 	if (!saveToFile_ && maxStreamFps_ > 0)
 	{
-		const double frameInterval = 1.0 / static_cast<double>(maxStreamFps_);
+		const double effectiveCaptureFps = GetEffectiveCaptureFps();
+		const double frameInterval = effectiveCaptureFps > 0.0 ? (1.0 / effectiveCaptureFps) : 0.0;
 		captureAccumulator_ += static_cast<double>(deltaTime);
-		if (captureAccumulator_ < frameInterval)
+		if (frameInterval > 0.0 && captureAccumulator_ < frameInterval)
 		{
 			return;
 		}
-		captureAccumulator_ = std::min(captureAccumulator_ - frameInterval, frameInterval);
+		if (frameInterval > 0.0)
+		{
+			captureAccumulator_ = std::min(captureAccumulator_ - frameInterval, frameInterval);
+		}
 	}
 
 	Capture();
@@ -259,6 +266,49 @@ void AViewSynthesizer::SavePreviewLayout()
 	previewLayoutSavePending_ = false;
 }
 
+void AViewSynthesizer::SetUseLegacyPackedStreamFormat(bool value)
+{
+	bool resetFailed = false;
+
+	{
+		const std::lock_guard<std::mutex> lock(streamMutex_);
+
+		if (useLegacyPackedStreamFormat_ == value)
+		{
+			return;
+		}
+
+		const bool previousValue = useLegacyPackedStreamFormat_;
+		useLegacyPackedStreamFormat_ = value;
+
+		if (transmitEnabled_ && !ResetStreams())
+		{
+			useLegacyPackedStreamFormat_ = previousValue;
+			resetFailed = true;
+
+			if (!ResetStreams())
+			{
+				transmitEnabled_ = false;
+				useEditorTick_ = false;
+				wantsStop_ = false;
+				captureAccumulator_ = 0.0;
+			}
+		}
+	}
+
+	if (resetFailed)
+	{
+		Debug::Log("Unable to apply outgoing stream format change while transmitting");
+	}
+
+	UpdatePreviewLayoutControls();
+}
+
+bool AViewSynthesizer::GetUseLegacyPackedStreamFormat() const
+{
+	return useLegacyPackedStreamFormat_;
+}
+
 bool AViewSynthesizer::StartStreams()
 {
     // TODO: More sanity checks should be added here
@@ -285,10 +335,12 @@ bool AViewSynthesizer::StartStreams()
     frameWidth += (8 - (frameWidth % 8)) % 8;
     frameHeight += (8 - (frameHeight % 8)) % 8;
 
-    const uint32_t expectedStreamFps = static_cast<uint32_t>(std::max(maxStreamFps_, 1));
+	const uint32_t expectedStreamFps = GetExpectedPerStreamFps();
+	const uint16_t packedFrameHeight = static_cast<uint16_t>(frameHeight * 2);
+	const uint32_t outgoingStreamCount = GetOutgoingViewStreamCount();
 
-    wantsStop_ = false;
-    frameNumber_ = 0;
+	wantsStop_ = false;
+	frameNumber_ = 0;
     startTimestampMs_ = 0;
     captureAccumulator_ = 0.0;
 
@@ -300,12 +352,79 @@ bool AViewSynthesizer::StartStreams()
     resultRenderTarget_->ResizeTarget(frameWidth, frameHeight);
     UpdatePreviewOverlayLayout();
 
-    try
-    {
-        if (saveToFile_)
-        {
-            frontReader_ = nullptr;
-            rearReader_ = new RenderTargetReader({ rearRenderTarget_ }, true, depthRange_);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("ViewSynthesizer: Starting streams with maxStreamFps=%d total, outgoingStreams=%u, captureFps=%.2f, expectedPerStreamFps=%u, packedFormat=%d"),
+		maxStreamFps_,
+		outgoingStreamCount,
+		GetEffectiveCaptureFps(),
+		expectedStreamFps,
+		useLegacyPackedStreamFormat_ ? 1 : 0);
+
+	try
+	{
+		auto CreateHevcEncoder = [this, frameWidth, expectedStreamFps](const uint16_t encodedFrameHeight) -> PipelineFilter<1, 1>*
+		{
+			return new HevcEncoder(
+				frameWidth,
+				encodedFrameHeight,
+				16,
+				quantizationParameter_,
+				wavefrontParallelProcessing_,
+				overlappedWavefront_,
+				HevcPresetMinimumLatency,
+				hevcEncoderBackend_,
+				targetBitrateMbps_,
+				static_cast<uint32_t>(maxKeyFrameInterval_),
+				expectedStreamFps);
+		};
+
+		// The legacy transport stacks an auxiliary YUV plane underneath the color image.
+		// Color-only mode keeps the metadata SEI path but skips the stacked plane.
+		auto CreateColorOnlyEncodeChain = [frameWidth, frameHeight, &CreateHevcEncoder]() -> PipelineFilter<1, 1>*
+		{
+			return new ImageSequentialFilter(
+				{
+					new RgbaToYuvConverter(frameWidth, frameHeight),
+					CreateHevcEncoder(frameHeight)
+				});
+		};
+
+		auto CreatePackedFrontEncodeChain = [frameWidth, frameHeight, packedFrameHeight, &CreateHevcEncoder]() -> PipelineFilter<1, 1>*
+		{
+			return new ImageSequentialFilter(
+				{
+					new ScaffoldingAdapter<1, 1>(
+						new ScaffoldingDuplicator<2>(),
+						new ScaffoldingAdapter<2, 1>(
+							new ScaffoldingParallelFilter<2>(
+								{
+									new RgbaToYuvConverter(frameWidth, frameHeight),
+									new DepthToYuvConverter()
+								}),
+							new ImageConcatenator<2>(frameWidth, frameHeight))
+					),
+					CreateHevcEncoder(packedFrameHeight)
+				});
+		};
+
+		auto CreatePackedRearEncodeChain = [frameWidth, frameHeight, packedFrameHeight, &CreateHevcEncoder]() -> PipelineFilter<1, 1>*
+		{
+			return new ImageSequentialFilter(
+				{
+					new RgbaToYuvConverter(frameWidth, frameHeight),
+					new ScaffoldingSidechainSource<1, 1>(
+						new SolidColorImageGenerator(frameWidth, frameHeight, 0, 128, 128),
+						new ImageConcatenator<2>(frameWidth, frameHeight)),
+					CreateHevcEncoder(packedFrameHeight),
+				});
+		};
+
+		if (saveToFile_)
+		{
+			frontReader_ = nullptr;
+			rearReader_ = new RenderTargetReader({ rearRenderTarget_ }, true, depthRange_);
 
             runners_.push_back(
                 new AsyncPipelineRunner(
@@ -327,54 +446,34 @@ bool AViewSynthesizer::StartStreams()
         }
         else
         {
-            frontReader_ = new RenderTargetReader({ frontRenderTarget_ }, true, depthRange_);
-            rearReader_ = new RenderTargetReader({ rearRenderTarget_ }, true, depthRange_);
+	            frontReader_ = new RenderTargetReader({ frontRenderTarget_ }, true, depthRange_);
+	            rearReader_ = new RenderTargetReader({ rearRenderTarget_ }, true, depthRange_);
+
+	            runners_.push_back(
+	                new AsyncPipelineRunner(
+	                    new Pipeline(
+	                        frontReader_,
+	                        new ScaffoldingAdapter<2, 1>(
+	                            new ScaffoldingParallelFilter<2>(
+	                                {
+	                                    useLegacyPackedStreamFormat_ ? CreatePackedFrontEncodeChain() : CreateColorOnlyEncodeChain(),
+	                                    new ImageSequentialFilter()
+	                                }),
+	                            new SeiEmbedder("CiThruSViewSynth")),
+	                        new RtpTransmitter(TCHAR_TO_UTF8(*remoteStreamIp_), remoteStreamPort_ + 1))));
 
             runners_.push_back(
                 new AsyncPipelineRunner(
-                    new Pipeline(
-                        frontReader_,
-                        new ScaffoldingAdapter<2, 1>(
-                            new ScaffoldingParallelFilter<2>(
-                                {
-                                    new ImageSequentialFilter(
-                                    {
-                                        new ScaffoldingAdapter<1, 1>(
-                                            new ScaffoldingDuplicator<2>(),
-                                            new ScaffoldingAdapter<2, 1>(
-                                                new ScaffoldingParallelFilter<2>(
-                                                {
-                                                    new RgbaToYuvConverter(frameWidth, frameHeight),
-                                                    new DepthToYuvConverter()
-                                                }),
-                                                new ImageConcatenator<2>(frameWidth, frameHeight))
-                                        ),
-                                        new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency, hevcEncoderBackend_, targetBitrateMbps_, static_cast<uint32_t>(maxKeyFrameInterval_), expectedStreamFps)
-                                    }),
-                                    new ImageSequentialFilter()
-                                }),
-                            new SeiEmbedder("CiThruSViewSynth")),
-                        new RtpTransmitter(TCHAR_TO_UTF8(*remoteStreamIp_), remoteStreamPort_ + 1))));
-
-            runners_.push_back(
-                new AsyncPipelineRunner(
-                    new Pipeline(
-                        rearReader_,
-                        new ScaffoldingAdapter<2, 1>(
-                            new ScaffoldingParallelFilter<2>(
-                                {
-                                    new ImageSequentialFilter(
-                                        {
-                                            new RgbaToYuvConverter(frameWidth, frameHeight),
-                                            new ScaffoldingSidechainSource<1, 1>(
-                                                new SolidColorImageGenerator(frameWidth, frameHeight, 0, 128, 128),
-                                                new ImageConcatenator<2>(frameWidth, frameHeight)),
-                                            new HevcEncoder(frameWidth, frameHeight * 2, 16, quantizationParameter_, wavefrontParallelProcessing_, overlappedWavefront_, HevcPresetMinimumLatency, hevcEncoderBackend_, targetBitrateMbps_, static_cast<uint32_t>(maxKeyFrameInterval_), expectedStreamFps),
-                                        }),
-                                    new ImageSequentialFilter()
-                                }),
-                            new SeiEmbedder("CiThruSViewSynth")),
-                        new RtpTransmitter(TCHAR_TO_UTF8(*remoteStreamIp_), remoteStreamPort_))));
+	                    new Pipeline(
+	                        rearReader_,
+	                        new ScaffoldingAdapter<2, 1>(
+	                            new ScaffoldingParallelFilter<2>(
+	                                {
+	                                    useLegacyPackedStreamFormat_ ? CreatePackedRearEncodeChain() : CreateColorOnlyEncodeChain(),
+	                                    new ImageSequentialFilter()
+	                                }),
+	                            new SeiEmbedder("CiThruSViewSynth")),
+	                        new RtpTransmitter(TCHAR_TO_UTF8(*remoteStreamIp_), remoteStreamPort_))));
 
             runners_.push_back(
                 new AsyncPipelineRunner(
@@ -655,15 +754,36 @@ void AViewSynthesizer::UpdatePreviewOverlayLayout()
 
 void AViewSynthesizer::UpdatePreviewLayoutControls()
 {
-	if (!previewXSpinBox_.IsValid() || !previewYSpinBox_.IsValid() || !previewSizeSpinBox_.IsValid())
+	if (!legacyPackedStreamFormatCheckBox_.IsValid() &&
+		!previewXSpinBox_.IsValid() &&
+		!previewYSpinBox_.IsValid() &&
+		!previewSizeSpinBox_.IsValid())
 	{
 		return;
 	}
 
 	previewLayoutControlsSyncInProgress_ = true;
-	previewXSpinBox_->SetValue(previewXPercent_);
-	previewYSpinBox_->SetValue(previewYPercent_);
-	previewSizeSpinBox_->SetValue(previewSizePercent_);
+
+	if (legacyPackedStreamFormatCheckBox_.IsValid())
+	{
+		legacyPackedStreamFormatCheckBox_->SetIsChecked(useLegacyPackedStreamFormat_);
+	}
+
+	if (previewXSpinBox_.IsValid())
+	{
+		previewXSpinBox_->SetValue(previewXPercent_);
+	}
+
+	if (previewYSpinBox_.IsValid())
+	{
+		previewYSpinBox_->SetValue(previewYPercent_);
+	}
+
+	if (previewSizeSpinBox_.IsValid())
+	{
+		previewSizeSpinBox_->SetValue(previewSizePercent_);
+	}
+
 	previewLayoutControlsSyncInProgress_ = false;
 }
 
@@ -700,6 +820,11 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 		previewXSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_X_SPIN_BOX_WIDGET_NAME)));
 	}
 
+	if (!legacyPackedStreamFormatCheckBox_.IsValid())
+	{
+		legacyPackedStreamFormatCheckBox_ = Cast<UCheckBox>(widgetTree->FindWidget(FName(LEGACY_PACKED_STREAM_FORMAT_CHECK_BOX_WIDGET_NAME)));
+	}
+
 	if (!previewYSpinBox_.IsValid())
 	{
 		previewYSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_Y_SPIN_BOX_WIDGET_NAME)));
@@ -710,7 +835,7 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 		previewSizeSpinBox_ = Cast<USpinBox>(widgetTree->FindWidget(FName(PREVIEW_SIZE_SPIN_BOX_WIDGET_NAME)));
 	}
 
-	if (!previewXSpinBox_.IsValid() || !previewYSpinBox_.IsValid() || !previewSizeSpinBox_.IsValid())
+	if (!legacyPackedStreamFormatCheckBox_.IsValid() || !previewXSpinBox_.IsValid() || !previewYSpinBox_.IsValid() || !previewSizeSpinBox_.IsValid())
 	{
 		UVerticalBox* container = nullptr;
 		int32 largestContainerChildCount = INDEX_NONE;
@@ -738,20 +863,81 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 			return;
 		}
 
-		UVerticalBox* previewSection = widgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), FName(PREVIEW_LAYOUT_SECTION_WIDGET_NAME));
-		UTextBlock* sectionHeader = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
-		sectionHeader->SetText(FText::FromString(TEXT("Preview Layout")));
-		sectionHeader->SetJustification(ETextJustify::Center);
+		auto ApplyTextStyle = [](UTextBlock* textBlock, const int32 fontSize)
 		{
-			FSlateFontInfo sectionHeaderFont = sectionHeader->GetFont();
-			sectionHeaderFont.Size = PREVIEW_LAYOUT_HEADER_FONT_SIZE;
-			sectionHeader->SetFont(sectionHeaderFont);
+			if (!textBlock)
+			{
+				return;
+			}
+
+			FSlateFontInfo font = textBlock->GetFont();
+			font.Size = fontSize;
+			textBlock->SetFont(font);
+		};
+
+		auto AddSectionHeader = [&](UVerticalBox* section, const TCHAR* headerText)
+		{
+			UTextBlock* sectionHeader = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+			sectionHeader->SetText(FText::FromString(headerText));
+			sectionHeader->SetJustification(ETextJustify::Center);
+			ApplyTextStyle(sectionHeader, PREVIEW_LAYOUT_HEADER_FONT_SIZE);
+
+			if (UVerticalBoxSlot* headerSlot = section->AddChildToVerticalBox(sectionHeader))
+			{
+				headerSlot->SetPadding(FMargin(0.0f, PREVIEW_LAYOUT_SECTION_PADDING, 0.0f, PREVIEW_LAYOUT_ROW_PADDING));
+			}
+		};
+
+		auto AddCheckBoxRow = [&](UVerticalBox* section, const TCHAR* checkBoxWidgetName, const TCHAR* labelText, const TCHAR* toolTipText) -> UCheckBox*
+		{
+			UHorizontalBox* row = widgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+			UTextBlock* label = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+			label->SetText(FText::FromString(labelText));
+			label->SetAutoWrapText(true);
+			label->SetToolTipText(FText::FromString(toolTipText));
+			ApplyTextStyle(label, PREVIEW_LAYOUT_LABEL_FONT_SIZE);
+
+			if (UHorizontalBoxSlot* labelSlot = row->AddChildToHorizontalBox(label))
+			{
+				labelSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				labelSlot->SetVerticalAlignment(VAlign_Center);
+				labelSlot->SetPadding(FMargin(0.0f, 0.0f, PREVIEW_LAYOUT_ROW_PADDING, 0.0f));
+			}
+
+			UCheckBox* checkBox = widgetTree->ConstructWidget<UCheckBox>(UCheckBox::StaticClass(), FName(checkBoxWidgetName));
+			checkBox->SetIsChecked(useLegacyPackedStreamFormat_);
+			checkBox->SetToolTipText(FText::FromString(toolTipText));
+
+			if (UHorizontalBoxSlot* checkBoxSlot = row->AddChildToHorizontalBox(checkBox))
+			{
+				checkBoxSlot->SetVerticalAlignment(VAlign_Center);
+				checkBoxSlot->SetHorizontalAlignment(HAlign_Right);
+			}
+
+			if (UVerticalBoxSlot* rowSlot = section->AddChildToVerticalBox(row))
+			{
+				rowSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, PREVIEW_LAYOUT_ROW_PADDING));
+			}
+
+			return checkBox;
+		};
+
+		UVerticalBox* outgoingStreamSection = widgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), FName(OUTGOING_STREAM_SECTION_WIDGET_NAME));
+		AddSectionHeader(outgoingStreamSection, TEXT("Outgoing Stream"));
+		legacyPackedStreamFormatCheckBox_ = AddCheckBoxRow(
+			outgoingStreamSection,
+			LEGACY_PACKED_STREAM_FORMAT_CHECK_BOX_WIDGET_NAME,
+			TEXT("Legacy packed format (2x height)"),
+			TEXT("On: send the current doubled-height packed view-synthesis stream format. Off: send color-only HEVC frames at the configured width and height."));
+
+		if (UVerticalBoxSlot* sectionSlot = container->AddChildToVerticalBox(outgoingStreamSection))
+		{
+			sectionSlot->SetPadding(FMargin(0.0f, PREVIEW_LAYOUT_SECTION_PADDING, 0.0f, 0.0f));
 		}
 
-		if (UVerticalBoxSlot* headerSlot = previewSection->AddChildToVerticalBox(sectionHeader))
-		{
-			headerSlot->SetPadding(FMargin(0.0f, PREVIEW_LAYOUT_SECTION_PADDING, 0.0f, PREVIEW_LAYOUT_ROW_PADDING));
-		}
+		UVerticalBox* previewSection = widgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), FName(PREVIEW_LAYOUT_SECTION_WIDGET_NAME));
+		AddSectionHeader(previewSection, TEXT("Preview Layout"));
 
 		auto AddPreviewSpinBoxRow = [&](const TCHAR* spinBoxWidgetName, const TCHAR* labelText) -> USpinBox*
 		{
@@ -761,11 +947,7 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 
 			UTextBlock* label = widgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
 			label->SetText(FText::FromString(labelText));
-			{
-				FSlateFontInfo labelFont = label->GetFont();
-				labelFont.Size = PREVIEW_LAYOUT_LABEL_FONT_SIZE;
-				label->SetFont(labelFont);
-			}
+			ApplyTextStyle(label, PREVIEW_LAYOUT_LABEL_FONT_SIZE);
 			labelBox->AddChild(label);
 
 			if (UHorizontalBoxSlot* labelSlot = row->AddChildToHorizontalBox(labelBox))
@@ -817,6 +999,11 @@ void AViewSynthesizer::TryInstallPreviewLayoutControls()
 	if (previewSizeSpinBox_.IsValid())
 	{
 		previewSizeSpinBox_->OnValueChanged.AddUniqueDynamic(this, &AViewSynthesizer::HandlePreviewSizeSpinBoxValueChanged);
+	}
+
+	if (legacyPackedStreamFormatCheckBox_.IsValid())
+	{
+		legacyPackedStreamFormatCheckBox_->OnCheckStateChanged.AddUniqueDynamic(this, &AViewSynthesizer::HandleUseLegacyPackedStreamFormatCheckStateChanged);
 	}
 
 	UpdatePreviewLayoutControls();
@@ -880,6 +1067,7 @@ AViewSynthesizer* AViewSynthesizer::ResolveControlledSynthesizer(UUserWidget* wi
 void AViewSynthesizer::ResetPreviewLayoutWidgetState()
 {
 	viewSynthesisControlWidget_.Reset();
+	legacyPackedStreamFormatCheckBox_.Reset();
 	previewXSpinBox_.Reset();
 	previewYSpinBox_.Reset();
 	previewSizeSpinBox_.Reset();
@@ -888,6 +1076,27 @@ void AViewSynthesizer::ResetPreviewLayoutWidgetState()
 float AViewSynthesizer::ClampPreviewPercent(float value) const
 {
 	return FMath::Clamp(value, PREVIEW_PERCENT_MIN, PREVIEW_PERCENT_MAX);
+}
+
+uint32 AViewSynthesizer::GetOutgoingViewStreamCount() const
+{
+	return saveToFile_ ? 1u : 2u;
+}
+
+double AViewSynthesizer::GetEffectiveCaptureFps() const
+{
+	if (maxStreamFps_ <= 0)
+	{
+		return 0.0;
+	}
+
+	return static_cast<double>(maxStreamFps_) / static_cast<double>(GetOutgoingViewStreamCount());
+}
+
+uint32 AViewSynthesizer::GetExpectedPerStreamFps() const
+{
+	const uint32 totalFpsBudget = maxStreamFps_ > 0 ? static_cast<uint32>(maxStreamFps_) : 30u;
+	return static_cast<uint32>(FMath::Max(1, FMath::RoundToInt(static_cast<float>(totalFpsBudget) / static_cast<float>(GetOutgoingViewStreamCount()))));
 }
 
 void AViewSynthesizer::ApplyPreviewLayout(float xPercent, float yPercent, float sizePercent)
@@ -998,6 +1207,16 @@ void AViewSynthesizer::HandlePreviewSizeSpinBoxValueChanged(float value)
 
 	SetPreviewSizePercent(value);
 	QueuePreviewLayoutSave();
+}
+
+void AViewSynthesizer::HandleUseLegacyPackedStreamFormatCheckStateChanged(bool bIsChecked)
+{
+	if (previewLayoutControlsSyncInProgress_)
+	{
+		return;
+	}
+
+	SetUseLegacyPackedStreamFormat(bIsChecked);
 }
 
 UUserWidget* AViewSynthesizer::FindMainMenuWidget()

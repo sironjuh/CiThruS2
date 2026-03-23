@@ -16,6 +16,7 @@
 
 class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
+class UCheckBox;
 class USpinBox;
 class UUserWidget;
 class RenderTargetReader;
@@ -75,6 +76,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Preview Layout")
 	void SavePreviewLayout();
 
+	UFUNCTION(BlueprintCallable, Category = "Stream Controls")
+	void SetUseLegacyPackedStreamFormat(bool value);
+
+	UFUNCTION(BlueprintCallable, Category = "Stream Controls")
+	bool GetUseLegacyPackedStreamFormat() const;
+
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	FString remoteStreamIp_ = "127.0.0.1";
 
@@ -82,10 +89,10 @@ public:
 	int remoteStreamPort_ = 12300;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
-	int remoteStreamWidth_ = 1024;
+	int remoteStreamWidth_ = 640;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
-	int remoteStreamHeight_ = 1024;
+	int remoteStreamHeight_ = 480;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	float frontFov_ = 90.0f;
@@ -105,13 +112,27 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	EHevcEncoderBackend hevcEncoderBackend_ = EHevcEncoderBackend::Auto;
 
+	UPROPERTY(
+		BlueprintReadWrite,
+		EditAnywhere,
+		Category = "General Stream Settings",
+		meta = (
+			DisplayName = "Use Legacy Packed Stream Format",
+			ToolTip = "When enabled, outgoing view-synthesis streams use the current doubled-height packed format. Disable to send color-only HEVC frames at the configured width and height."))
+	bool useLegacyPackedStreamFormat_ = true;
+
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
-	float targetBitrateMbps_ = 1.5f;
+	float targetBitrateMbps_ = 2.0f;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
 	int maxKeyFrameInterval_ = 60;
 
-	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
+	UPROPERTY(
+		BlueprintReadWrite,
+		EditAnywhere,
+		Category = "General Stream Settings",
+		meta = (
+			ToolTip = "Total target FPS budget across the outgoing view-synthesis RTP inputs. When both front and rear streams are active, each stream is sent at roughly half of this rate."))
 	int maxStreamFps_ = 30;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "General Stream Settings")
@@ -190,6 +211,7 @@ protected:
 
 	TWeakObjectPtr<UUserWidget> mainMenuWidget_;
 	TWeakObjectPtr<UUserWidget> viewSynthesisControlWidget_;
+	TWeakObjectPtr<UCheckBox> legacyPackedStreamFormatCheckBox_;
 	TWeakObjectPtr<USpinBox> previewXSpinBox_;
 	TWeakObjectPtr<USpinBox> previewYSpinBox_;
 	TWeakObjectPtr<USpinBox> previewSizeSpinBox_;
@@ -223,6 +245,9 @@ protected:
 	void QueuePreviewLayoutSave();
 	void FlushPendingPreviewLayoutSave();
 	bool TryGetPreviewViewportSize(FVector2D& outViewportSize) const;
+	uint32 GetOutgoingViewStreamCount() const;
+	double GetEffectiveCaptureFps() const;
+	uint32 GetExpectedPerStreamFps() const;
 
 	UFUNCTION()
 	void HandlePreviewXSpinBoxValueChanged(float value);
@@ -232,6 +257,9 @@ protected:
 
 	UFUNCTION()
 	void HandlePreviewSizeSpinBoxValueChanged(float value);
+
+	UFUNCTION()
+	void HandleUseLegacyPackedStreamFormatCheckStateChanged(bool bIsChecked);
 
 	UUserWidget* FindMainMenuWidget();
 	bool IsMainMenuOpen();

@@ -5,7 +5,15 @@
 #include <vector>
 #include <chrono>
 
+namespace
+{
+	constexpr double RTP_PERF_LOG_INTERVAL_SECONDS = 2.0;
+}
+
 RtpTransmitter::RtpTransmitter(const std::string& ip, const int& dstPort)
+	: destinationIp_(ip)
+	, destinationPort_(dstPort)
+	, perfWindowStart_(std::chrono::steady_clock::now())
 {
 #ifdef CITHRUS_UVGRTP_AVAILABLE
 	streamSession_ = streamContext_.create_session(ip);
@@ -146,6 +154,7 @@ void RtpTransmitter::Process()
 	// Send each NAL unit individually (without start codes)
 	// uvgRTP will handle RFC 7798 packetization (Single NAL, AP, or FU)
 	int nalIndex = 0;
+	bool frameSendFailed = false;
 	for (const auto& nal : nalUnits)
 	{
 		// Extract NAL type for logging
@@ -162,11 +171,54 @@ void RtpTransmitter::Process()
 		{
 			StreamPerfStats::AddRtpDrop();
 			UE_LOG(LogTemp, Error, TEXT("RtpTransmitter: push_frame failed err=%d, nalType=%d, nalSize=%d"), (int)err, nalType, (int)nal.second);
+			frameSendFailed = true;
 			break;
 		}
 		nalIndex++;
 	}
 	auto sendEnd = std::chrono::high_resolution_clock::now();
 	StreamPerfStats::AddRtpSendSample(std::chrono::duration<double, std::milli>(sendEnd - sendStart).count());
+	if (!frameSendFailed && !nalUnits.empty())
+	{
+		++perfFramesSent_;
+		perfNalUnitsSent_ += static_cast<uint64_t>(nalUnits.size());
+		perfBytesSent_ += static_cast<uint64_t>(inputSize);
+		LogSendPerformanceIfNeeded();
+	}
 #endif // CITHRUS_UVGRTP_AVAILABLE
+}
+
+void RtpTransmitter::LogSendPerformanceIfNeeded()
+{
+	const auto now = std::chrono::steady_clock::now();
+	const double elapsedSeconds = std::chrono::duration<double>(now - perfWindowStart_).count();
+	if (elapsedSeconds < RTP_PERF_LOG_INTERVAL_SECONDS || perfFramesSent_ == 0)
+	{
+		return;
+	}
+
+	const double fps = static_cast<double>(perfFramesSent_) / elapsedSeconds;
+	const double nalUnitsPerSecond = static_cast<double>(perfNalUnitsSent_) / elapsedSeconds;
+	const double bitrateMbps = (static_cast<double>(perfBytesSent_) * 8.0) / (elapsedSeconds * 1000.0 * 1000.0);
+	const double avgFrameKilobytes = static_cast<double>(perfBytesSent_) / (static_cast<double>(perfFramesSent_) * 1024.0);
+	const double avgNalsPerFrame = static_cast<double>(perfNalUnitsSent_) / static_cast<double>(perfFramesSent_);
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("RtpTransmitter PERF [%s:%d]: fps=%.2f bitrate=%.2f Mbps avgFrame=%.1f KiB avgNALs=%.2f nalsPerSec=%.2f frames=%llu window=%.2fs"),
+		*FString(destinationIp_.c_str()),
+		destinationPort_,
+		fps,
+		bitrateMbps,
+		avgFrameKilobytes,
+		avgNalsPerFrame,
+		nalUnitsPerSecond,
+		static_cast<unsigned long long>(perfFramesSent_),
+		elapsedSeconds);
+
+	perfWindowStart_ = now;
+	perfFramesSent_ = 0;
+	perfNalUnitsSent_ = 0;
+	perfBytesSent_ = 0;
 }

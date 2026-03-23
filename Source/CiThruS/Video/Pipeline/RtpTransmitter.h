@@ -31,6 +31,7 @@
 #include "CoreMinimal.h"
 #include "PipelineSink.h"
 
+#include <chrono>
 #include <string>
 
 // Transmits data in an RTP stream
@@ -41,6 +42,7 @@ public:
 	virtual ~RtpTransmitter();
 
 	virtual void Process() override;
+	void LogSendPerformanceIfNeeded();
 
 protected:
 #ifdef CITHRUS_UVGRTP_AVAILABLE
@@ -48,4 +50,11 @@ protected:
 	uvgrtp::session* streamSession_;
 	uvgrtp::media_stream* stream_;
 #endif // CITHRUS_UVGRTP_AVAILABLE
+
+	std::string destinationIp_;
+	int destinationPort_ = 0;
+	std::chrono::steady_clock::time_point perfWindowStart_;
+	uint64_t perfFramesSent_ = 0;
+	uint64_t perfNalUnitsSent_ = 0;
+	uint64_t perfBytesSent_ = 0;
 };

@@ -25,8 +25,10 @@ void DepthToYuvConverter::Process()
 	const uint8_t* inputData = GetInputPin<0>().GetData();
 	uint32_t inputSize = GetInputPin<0>().GetSize();
 
-	if (!inputData)
+	if (!inputData || inputSize == 0)
 	{
+		GetOutputPin<0>().SetData(nullptr);
+		GetOutputPin<0>().SetSize(0);
 		return;
 	}
 
@@ -51,4 +53,7 @@ void DepthToYuvConverter::Process()
 		{
 			return input[3];
 		});
+
+	GetOutputPin<0>().SetData(outputData_);
+	GetOutputPin<0>().SetSize(outputSize_);
 }

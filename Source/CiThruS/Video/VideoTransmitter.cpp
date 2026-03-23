@@ -102,7 +102,7 @@ void AVideoTransmitter::Tick(float deltaTime)
 		return;
 	}
 
-	if (!capture360_ && maxStreamFps_ > 0)
+	if (maxStreamFps_ > 0)
 	{
 		const double frameInterval = 1.0 / static_cast<double>(maxStreamFps_);
 		captureAccumulator_ += static_cast<double>(deltaTime);
@@ -166,7 +166,7 @@ bool AVideoTransmitter::StartStreams()
 	frameWidth += (8 - (frameWidth % 8)) % 8;
 	frameHeight += (8 - (frameHeight % 8)) % 8;
 
-	const uint32_t expectedStreamFps = maxStreamFps_ > 0 ? static_cast<uint32_t>(maxStreamFps_) : 60u;
+	const uint32_t expectedStreamFps = maxStreamFps_ > 0 ? static_cast<uint32_t>(maxStreamFps_) : 30u;
 	const EHevcEncoderBackend resolvedBackend = HevcEncoder::ResolveBackend(hevcEncoderBackend_);
 	capture360_ = enable360Capture_;
 
